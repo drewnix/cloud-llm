@@ -1,4 +1,4 @@
-# Building a Self-Hosted Coding LLM on AWS with Terragrunt Stacks
+# Cloud LLM Tutorial: Building a Self-Hosted Coding LLM on AWS with Terragrunt Stacks
 
 You want a private coding assistant -- an LLM you control, running on your own hardware, behind your own domain. No API metering, no data leaving your network, no vendor lock-in. By the end of this tutorial you will have a GPU-powered [Qwen 2.5 Coder 32B](https://huggingface.co/Qwen/Qwen2.5-Coder-32B-Instruct-AWQ) instance served by [vLLM](https://github.com/vllm-project/vllm) with an [Open WebUI](https://github.com/open-webui/open-webui) chat interface, TLS-terminated behind an ALB, addressable at `llm.yourdomain.com` -- and every piece of infrastructure defined in code with Terragrunt Stacks.
 
@@ -46,6 +46,10 @@ This tutorial assumes you are comfortable writing Terraform modules but have not
   - [Swapping the LLM Model](#swapping-the-llm-model)
   - [Cost Controls](#cost-controls)
   - [Stack Commands](#stack-commands)
+  - [Feature Flags](#feature-flags)
+  - [Error Handling](#error-handling)
+  - [Provider Cache](#provider-cache)
+  - [Filtering Units](#filtering-units)
   - [Extending the Stack](#extending-the-stack)
 - [Recap](#recap)
 
@@ -57,15 +61,15 @@ This tutorial assumes you are comfortable writing Terraform modules but have not
 
 If you have shipped Terraform to production, you have probably run into these pain points:
 
-**Repeated backend configuration.** Every module needs a `backend "s3"` block. Copy it once, fine. Copy it across 8 modules and 2 environments and you have 16 nearly identical blocks to keep in sync.
+* **Repeated backend configuration.** Every module needs a `backend "s3"` block. Copy it once, fine. Copy it across 8 modules and 2 environments and you have 16 nearly identical blocks to keep in sync.
 
-**Repeated provider blocks.** Same story. Every module declares `provider "aws" { region = "us-east-1" }` and you update them one at a time when something changes.
+* **Repeated provider blocks.** Same story. Every module declares `provider "aws" { region = "us-east-1" }` and you update them one at a time when something changes.
 
-**No dependency orchestration.** Terraform operates on one state file at a time. If your security groups need the VPC ID, you either put everything in one giant state (fragile, slow) or you glue modules together with `terraform_remote_state` data sources and hope you remember the apply order.
+* **No dependency orchestration.** Terraform operates on one state file at a time. If your security groups need the VPC ID, you either put everything in one giant state (fragile, slow) or you glue modules together with `terraform_remote_state` data sources and hope you remember the apply order.
 
-**Environment drift.** Dev and prod diverge because they are separate directories with duplicated `.tf` files. A variable added in dev never makes it to prod, or worse, the wrong value does.
+* **Environment drift.** Dev and prod diverge because they are separate directories with duplicated `.tf` files. A variable added in dev never makes it to prod, or worse, the wrong value does.
 
-Terragrunt solves all four:
+Terr agrunt solves all four:
 
 | Problem | Terragrunt Solution |
 |---|---|
@@ -82,9 +86,9 @@ Traditional Terragrunt solves the problems above, but introduces a new one: **du
 
 Terragrunt Stacks (GA since May 2025) solve this with two concepts:
 
-**Unit templates** live in a shared `units/` directory. Each template defines how a module gets wired up -- its Terraform source, its dependencies, its inputs. A unit template is written once and used by every environment.
+* **Unit templates** live in a shared `units/` directory. Each template defines how a module gets wired up -- its Terraform source, its dependencies, its inputs. A unit template is written once and used by every environment.
 
-**Stack files** (`terragrunt.stack.hcl`) are blueprints for an entire environment. A stack file says "I want these units, in this directory layout, with these values." One file replaces 8 individual `terragrunt.hcl` files.
+* **Stack files** (`terragrunt.stack.hcl`) are blueprints for an entire environment. A stack file says "I want these units, in this directory layout, with these values." One file replaces 8 individual `terragrunt.hcl` files.
 
 The result: instead of 16 wiring files (8 per environment), you have 8 unit templates shared by all environments and 1 stack file per environment. Adding a new environment means writing one stack file and one `env.hcl`. No copying, no drift.
 
@@ -144,11 +148,11 @@ The project has three layers, each with a distinct job:
  └─────────────────────────────────────────────────┘
 ```
 
-**Modules** are plain Terraform. They define what resources to create. Nothing Terragrunt-specific lives here.
+* **Modules** are plain Terraform. They define what resources to create. Nothing Terragrunt-specific lives here.
 
-**Units** are the wiring layer. Each unit template says: use this module, depend on these other units, map these values to inputs. Units reference dependency paths that the stack will provide at composition time.
+* **Units** are the wiring layer. Each unit template says: use this module, depend on these other units, map these values to inputs. Units reference dependency paths that the stack will provide at composition time.
 
-**Stacks** are the composition layer. A stack file declares which units to include, where to place them, and what values to pass. It is the blueprint for a complete environment.
+* **Stacks** are the composition layer. A stack file declares which units to include, where to place them, and what values to pass. It is the blueprint for a complete environment.
 
 Data flows downward: the stack file passes values to units, and units pass inputs to modules. Dependencies flow between units, resolved automatically by Terragrunt.
 
@@ -247,6 +251,21 @@ remote_state {
   generate = {
     path      = "backend.tf"
     if_exists = "overwrite_terragrunt"
+  }
+}
+
+# --- Error Handling ---
+# Retry logic for transient AWS API errors during parallel deploys.
+errors {
+  retry "transient_aws" {
+    retryable_errors = [
+      ".*RequestLimitExceeded.*",
+      ".*ThrottlingException.*",
+      ".*connection reset by peer.*",
+      ".*TLS handshake timeout.*",
+    ]
+    max_attempts       = 3
+    sleep_interval_sec = 10
   }
 }
 
@@ -543,6 +562,15 @@ The EC2 GPU unit has the most complex wiring in the project. It depends on five 
 
 ```hcl
 # units/ec2-gpu/terragrunt.hcl
+
+feature "deploy" {
+  default = true
+}
+
+exclude {
+  if      = !feature.deploy.value
+  actions = ["apply", "destroy", "plan"]
+}
 
 include "root" {
   path = find_in_parent_folders("root.hcl")
@@ -1188,6 +1216,113 @@ terragrunt apply   # Apply just the ALB
 terragrunt output  # Show ALB outputs
 ```
 
+### Feature Flags
+
+The GPU instance is the most expensive resource in the stack (~$1/hr on-demand). Sometimes you want to plan or operate the networking and supporting infrastructure without the GPU -- maybe you are iterating on ALB rules, or you just want to keep costs down between coding sessions.
+
+Terragrunt's `feature` block (available since v0.90) lets you define toggleable flags directly in a unit template. The ec2-gpu unit uses one:
+
+```hcl
+# units/ec2-gpu/terragrunt.hcl
+
+feature "deploy" {
+  default = true
+}
+
+exclude {
+  if      = !feature.deploy.value
+  actions = ["apply", "destroy", "plan"]
+}
+```
+
+The `feature "deploy"` block declares a boolean flag that defaults to `true`. The `exclude` block checks its value -- when `deploy` is `false`, Terragrunt skips the unit entirely for `apply`, `destroy`, and `plan` actions.
+
+Override it from the CLI:
+
+```bash
+# Plan the full stack WITHOUT the GPU instance
+cd live/dev/us-east-1
+terragrunt stack run plan --feature deploy=false
+
+# Apply everything except ec2-gpu
+terragrunt stack run apply --feature deploy=false
+
+# Normal deploy (GPU included, since default = true)
+terragrunt stack run apply
+```
+
+This is more ergonomic than `cd`-ing into the ec2-gpu directory and running `terragrunt destroy` -- the feature flag operates at the stack level, so you can plan the entire environment with or without the GPU in a single command. The networking, ALB, DNS, and model cache all stay up, so re-enabling the GPU later is fast (no re-creating the VPC or waiting for ACM validation).
+
+### Error Handling
+
+When Terragrunt applies 8 units in parallel, they all hit the AWS API simultaneously. AWS responds to burst traffic with throttling errors like `RequestLimitExceeded` and `ThrottlingException`. Without retry logic, these transient errors cause the deploy to fail even though nothing is actually wrong.
+
+The `errors` block in `root.hcl` handles this:
+
+```hcl
+# live/root.hcl
+
+errors {
+  retry "transient_aws" {
+    retryable_errors = [
+      ".*RequestLimitExceeded.*",
+      ".*ThrottlingException.*",
+      ".*connection reset by peer.*",
+      ".*TLS handshake timeout.*",
+    ]
+    max_attempts       = 3
+    sleep_interval_sec = 10
+  }
+}
+```
+
+Each pattern is a regex matched against the error message. When a match hits, Terragrunt waits `sleep_interval_sec` seconds and retries the operation, up to `max_attempts` times. Since this block is in `root.hcl`, every unit inherits it via `include "root"` -- no per-unit configuration needed.
+
+The `connection reset by peer` and `TLS handshake timeout` patterns catch transient network issues that occasionally surface during long-running Terraform applies, especially in regions with higher latency.
+
+### Provider Cache
+
+Each of the 8 units in the stack downloads its own copy of the AWS provider during `terraform init`. The AWS provider binary is roughly 100 MB, so a full `stack run apply` downloads ~800 MB of identical binaries.
+
+The `--provider-cache` flag tells Terragrunt to cache provider binaries and share them across all units:
+
+```bash
+cd live/dev/us-east-1
+terragrunt stack run apply --provider-cache
+```
+
+This downloads the AWS provider once and symlinks it into each unit's `.terraform/` directory. No configuration changes needed -- it is purely a CLI flag. On a slow connection, this cuts `init` time from minutes to seconds.
+
+You can also set it permanently with an environment variable:
+
+```bash
+export TG_PROVIDER_CACHE=1
+terragrunt stack run apply
+```
+
+### Filtering Units
+
+When you want to target specific units without `cd`-ing into generated directories, use the `--filter` flag:
+
+```bash
+cd live/dev/us-east-1
+
+# Plan only the ALB unit
+terragrunt stack run plan --filter='./us-east-1/.terragrunt-stack/alb'
+
+# Apply only ec2-gpu and its dependencies
+terragrunt stack run apply --filter='./us-east-1/.terragrunt-stack/ec2-gpu'
+```
+
+Filters accept path patterns relative to the stack directory. This is more convenient than navigating into `.terragrunt-stack/` subdirectories, especially when you want to run a command across a subset of units.
+
+For CI/CD pipelines, `--filter-affected` is particularly useful -- it compares against a base branch and only runs units that have changed:
+
+```bash
+# In CI: only plan/apply units affected by the current PR
+terragrunt stack run plan --filter-affected
+```
+
 ### Extending the Stack
 
 Adding a new component to the stack is a three-step process:
@@ -1254,5 +1389,9 @@ Here is what you built and the Stacks concepts each piece demonstrated:
 | **`terragrunt stack run`** | Deploy or destroy an entire environment with one command |
 | **Multi-environment** | Dev and prod share all 8 unit templates, differ only in stack values and `env.hcl` |
 | **Multi-provider** | Cloudflare DNS module declares its own provider; AWS provider is generated globally |
+| **`feature` + `exclude`** | ec2-gpu unit -- toggle GPU deployment with `--feature deploy=false` |
+| **`errors` block** | `root.hcl` -- automatic retry for transient AWS API errors during parallel deploys |
+| **`--provider-cache`** | CLI flag -- deduplicates provider downloads across all 8 units |
+| **`--filter`** | CLI flag -- target specific units without `cd`-ing into generated directories |
 
 The infrastructure itself -- a GPU instance running a quantized Qwen 2.5 Coder 32B behind an ALB with TLS, automated DNS, and model caching -- is production-grade. But the real takeaway is the Stacks pattern: modules define resources, units define wiring, stacks define environments. Write the unit once, compose it everywhere. When you internalize this three-layer architecture, you can apply it to any infrastructure project and never duplicate a wiring file again.

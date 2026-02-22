@@ -4,6 +4,15 @@
 # The main GPU instance running vLLM + Open WebUI. Has the most dependencies,
 # demonstrating how Terragrunt Stacks handle complex dependency graphs.
 
+feature "deploy" {
+  default = true
+}
+
+exclude {
+  if      = !feature.deploy.value
+  actions = ["apply", "destroy", "plan"]
+}
+
 include "root" {
   path = find_in_parent_folders("root.hcl")
 }

@@ -41,6 +41,24 @@ remote_state {
 }
 
 # -----------------------------------------------------------------------------
+# Error Handling
+# -----------------------------------------------------------------------------
+# Retry logic for transient AWS API errors. Common during parallel deploys
+# when 8 units hit the AWS API simultaneously.
+errors {
+  retry "transient_aws" {
+    retryable_errors = [
+      ".*RequestLimitExceeded.*",
+      ".*ThrottlingException.*",
+      ".*connection reset by peer.*",
+      ".*TLS handshake timeout.*",
+    ]
+    max_attempts       = 3
+    sleep_interval_sec = 10
+  }
+}
+
+# -----------------------------------------------------------------------------
 # AWS Provider Generation
 # -----------------------------------------------------------------------------
 # Generate an AWS provider block in every module. The region comes from the
