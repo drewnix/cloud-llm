@@ -1,0 +1,110 @@
+name: Drift Detection
+
+on:
+  schedule:
+    - cron: '0 6 * * *'   # Daily at 6am UTC
+  workflow_dispatch:        # Allow manual trigger
+
+permissions:
+  id-token: write
+  contents: read
+  issues: write
+
+env:
+  TG_PROVIDER_CACHE: "1"
+
+jobs:
+  detect-drift:
+    name: Drift Check (${{ matrix.environment }})
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - environment: dev
+            working_directory: live/dev/us-east-1
+          - environment: prod
+            working_directory: live/prod/us-east-1
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup tools
+        uses: ./.github/actions/terragrunt-setup
+
+      - name: Configure AWS credentials (OIDC)
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ vars.AWS_ROLE_ARN }}
+          aws-region: us-east-1
+
+      - name: Terragrunt plan (detect drift)
+        id: plan
+        working-directory: ${{ matrix.working_directory }}
+        continue-on-error: true
+        run: |
+          set -o pipefail
+          terragrunt stack run plan -no-color -detailed-exitcode 2>&1 | tee plan.txt
+          echo "exitcode=${PIPESTATUS[0]}" >> "$GITHUB_OUTPUT"
+
+      # Exit code 0 = no changes, 1 = error, 2 = changes detected (drift)
+      - name: Open or update drift issue
+        if: steps.plan.outputs.exitcode == '2'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          ENV_NAME: ${{ matrix.environment }}
+          WORKING_DIR: ${{ matrix.working_directory }}
+        run: |
+          DATE=$(date +%Y-%m-%d)
+          TITLE="Drift detected in ${ENV_NAME} - ${DATE}"
+
+          # Build issue body with plan output
+          PLAN_OUTPUT=$(cat plan.txt)
+          BODY="## Drift Detected
+
+          Infrastructure state in the **${ENV_NAME}** environment does not match the code on \`main\` as of ${DATE}.
+
+          <details>
+          <summary>Plan output (click to expand)</summary>
+
+          \`\`\`
+          ${PLAN_OUTPUT}
+          \`\`\`
+
+          </details>
+
+          **Next steps:**
+          - If the drift is intentional (e.g., manual scaling), update the code to match.
+          - If unintentional, re-apply from the Infrastructure Power workflow or run:
+            \`\`\`
+            cd ${WORKING_DIR} && terragrunt stack run apply
+            \`\`\`"
+
+          # Check for existing open drift issue for this environment
+          EXISTING=$(gh issue list \
+            --label "drift,${ENV_NAME}" \
+            --state open \
+            --limit 1 \
+            --json number \
+            -q '.[0].number')
+
+          if [ -n "$EXISTING" ]; then
+            echo "Updating existing drift issue #${EXISTING}"
+            gh issue comment "$EXISTING" --body "$BODY"
+          else
+            echo "Creating new drift issue"
+            gh issue create \
+              --title "$TITLE" \
+              --body "$BODY" \
+              --label "drift,${ENV_NAME}"
+          fi
+
+      - name: No drift detected
+        if: steps.plan.outputs.exitcode == '0'
+        run: echo "No drift detected in ${{ matrix.environment }}"
+
+      - name: Plan error
+        if: steps.plan.outputs.exitcode == '1'
+        run: |
+          echo "::error::Plan failed for ${{ matrix.environment }} -- check logs"
+          exit 1
