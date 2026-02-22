@@ -1,0 +1,140 @@
+name: PR Validation & Plan
+
+on:
+  pull_request:
+    branches: [main]
+    paths:
+      - 'modules/**'
+      - 'units/**'
+      - 'live/**'
+
+permissions:
+  id-token: write
+  contents: read
+  pull-requests: write
+
+env:
+  TG_PROVIDER_CACHE: "1"
+
+jobs:
+  # -------------------------------------------------------
+  # Job 1: Static validation (no AWS credentials needed)
+  # -------------------------------------------------------
+  validate:
+    name: Validate
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup tools
+        uses: ./.github/actions/terragrunt-setup
+
+      - name: Check HCL formatting
+        run: terragrunt hclfmt --check
+
+      - name: Init tflint
+        run: tflint --init --config "$GITHUB_WORKSPACE/.tflint.hcl"
+
+      - name: Lint Terraform modules
+        run: |
+          exit_code=0
+          for dir in modules/*/; do
+            echo "::group::tflint - $dir"
+            if ! tflint --config "$GITHUB_WORKSPACE/.tflint.hcl" "$dir"; then
+              exit_code=1
+            fi
+            echo "::endgroup::"
+          done
+          exit $exit_code
+
+      - name: Security scan
+        run: checkov -d modules/ --framework terraform --quiet --compact
+
+  # -------------------------------------------------------
+  # Job 2: Plan per environment (needs AWS credentials)
+  # -------------------------------------------------------
+  plan:
+    name: Plan (${{ matrix.environment }})
+    runs-on: ubuntu-latest
+    needs: validate
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - environment: dev
+            working_directory: live/dev/us-east-1
+          - environment: prod
+            working_directory: live/prod/us-east-1
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup tools
+        uses: ./.github/actions/terragrunt-setup
+
+      - name: Configure AWS credentials (OIDC)
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ vars.AWS_ROLE_ARN }}
+          aws-region: us-east-1
+
+      - name: Terragrunt plan
+        id: plan
+        working-directory: ${{ matrix.working_directory }}
+        continue-on-error: true
+        run: |
+          set -o pipefail
+          terragrunt stack run plan --filter-affected -no-color 2>&1 | tee plan.txt
+          echo "exitcode=${PIPESTATUS[0]}" >> "$GITHUB_OUTPUT"
+
+      - name: Setup Infracost
+        uses: infracost/actions/setup@v3
+        with:
+          api-key: ${{ secrets.INFRACOST_API_KEY }}
+
+      - name: Generate cost estimate
+        id: infracost
+        working-directory: ${{ matrix.working_directory }}
+        continue-on-error: true
+        run: |
+          infracost breakdown \
+            --path ".terragrunt-stack" \
+            --format json \
+            --out-file infracost.json
+          infracost output \
+            --path infracost.json \
+            --format github-comment \
+            --out-file infracost-comment.txt
+
+      - name: Build PR comment
+        id: comment
+        run: |
+          {
+            echo "### Terragrunt Plan: \`${{ matrix.environment }}\`"
+            echo ""
+            echo "<details>"
+            echo "<summary>Plan output (click to expand)</summary>"
+            echo ""
+            echo '```'
+            cat "${{ matrix.working_directory }}/plan.txt"
+            echo '```'
+            echo ""
+            echo "</details>"
+            echo ""
+            if [ -f "${{ matrix.working_directory }}/infracost-comment.txt" ]; then
+              echo "#### Cost Estimate"
+              echo ""
+              cat "${{ matrix.working_directory }}/infracost-comment.txt"
+            fi
+          } > comment.md
+
+      - name: Post PR comment
+        uses: marocchino/sticky-pull-request-comment@v2
+        with:
+          header: plan-${{ matrix.environment }}
+          path: comment.md
+
+      - name: Fail if plan errored
+        if: steps.plan.outputs.exitcode == '1'
+        run: exit 1
