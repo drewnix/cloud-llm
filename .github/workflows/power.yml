@@ -1,0 +1,95 @@
+name: Infrastructure Power
+
+on:
+  workflow_dispatch:
+    inputs:
+      environment:
+        description: 'Target environment'
+        required: true
+        type: choice
+        options:
+          - dev
+          - prod
+      action:
+        description: 'Power action'
+        required: true
+        type: choice
+        options:
+          - plan-only
+          - full-on
+          - standby
+          - full-off
+
+permissions:
+  id-token: write
+  contents: read
+
+env:
+  TG_PROVIDER_CACHE: "1"
+
+jobs:
+  power:
+    name: "${{ inputs.action }} (${{ inputs.environment }})"
+    runs-on: ubuntu-latest
+    environment: ${{ inputs.environment }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup tools
+        uses: ./.github/actions/terragrunt-setup
+
+      - name: Configure AWS credentials (OIDC)
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ vars.AWS_ROLE_ARN }}
+          aws-region: us-east-1
+
+      - name: Set working directory
+        id: dir
+        run: echo "path=live/${{ inputs.environment }}/us-east-1" >> "$GITHUB_OUTPUT"
+
+      # ---- Plan Only ----
+      - name: Plan
+        if: inputs.action == 'plan-only'
+        working-directory: ${{ steps.dir.outputs.path }}
+        run: terragrunt stack run plan -no-color
+
+      # ---- Full On: apply entire stack with GPU ----
+      - name: Full On
+        if: inputs.action == 'full-on'
+        working-directory: ${{ steps.dir.outputs.path }}
+        run: |
+          terragrunt stack run apply \
+            --feature deploy=true \
+            -auto-approve
+
+      # ---- Standby: GPU off, networking stays ----
+      - name: Standby
+        if: inputs.action == 'standby'
+        working-directory: ${{ steps.dir.outputs.path }}
+        run: |
+          terragrunt stack run apply \
+            --feature deploy=false \
+            -auto-approve
+
+      # ---- Full Off: destroy entire environment ----
+      - name: Full Off
+        if: inputs.action == 'full-off'
+        working-directory: ${{ steps.dir.outputs.path }}
+        run: |
+          terragrunt stack run destroy -auto-approve
+
+      - name: Summary
+        run: |
+          echo "## Infrastructure Power: ${{ inputs.action }}" >> "$GITHUB_STEP_SUMMARY"
+          echo "" >> "$GITHUB_STEP_SUMMARY"
+          echo "**Environment:** ${{ inputs.environment }}" >> "$GITHUB_STEP_SUMMARY"
+          echo "**Action:** ${{ inputs.action }}" >> "$GITHUB_STEP_SUMMARY"
+          echo "" >> "$GITHUB_STEP_SUMMARY"
+          case "${{ inputs.action }}" in
+            full-on)  echo "All infrastructure is running. GPU instance is active." >> "$GITHUB_STEP_SUMMARY" ;;
+            standby)  echo "GPU instance destroyed. Networking, ALB, DNS remain (~\$50/mo)." >> "$GITHUB_STEP_SUMMARY" ;;
+            full-off) echo "All infrastructure destroyed. Zero ongoing cost." >> "$GITHUB_STEP_SUMMARY" ;;
+            plan-only) echo "No changes applied. Review the plan output above." >> "$GITHUB_STEP_SUMMARY" ;;
+          esac
