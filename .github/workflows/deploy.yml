@@ -1,0 +1,90 @@
+name: Deploy
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - 'modules/**'
+      - 'units/**'
+      - 'live/**'
+
+permissions:
+  id-token: write
+  contents: read
+
+env:
+  TG_PROVIDER_CACHE: "1"
+
+jobs:
+  # -------------------------------------------------------
+  # Job 1: Deploy to dev (no approval gate)
+  # -------------------------------------------------------
+  deploy-dev:
+    name: Deploy Dev
+    runs-on: ubuntu-latest
+    environment: dev
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup tools
+        uses: ./.github/actions/terragrunt-setup
+
+      - name: Configure AWS credentials (OIDC)
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ vars.AWS_ROLE_ARN }}
+          aws-region: us-east-1
+
+      - name: Plan
+        working-directory: live/dev/us-east-1
+        run: |
+          terragrunt stack run plan \
+            --filter-affected \
+            --feature deploy=${{ vars.GPU_ENABLED || 'true' }} \
+            -no-color
+
+      - name: Apply
+        working-directory: live/dev/us-east-1
+        run: |
+          terragrunt stack run apply \
+            --filter-affected \
+            --feature deploy=${{ vars.GPU_ENABLED || 'true' }} \
+            -auto-approve
+
+  # -------------------------------------------------------
+  # Job 2: Deploy to prod (requires reviewer approval)
+  # -------------------------------------------------------
+  deploy-prod:
+    name: Deploy Prod
+    runs-on: ubuntu-latest
+    needs: deploy-dev
+    environment: prod
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup tools
+        uses: ./.github/actions/terragrunt-setup
+
+      - name: Configure AWS credentials (OIDC)
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ vars.AWS_ROLE_ARN }}
+          aws-region: us-east-1
+
+      - name: Plan
+        working-directory: live/prod/us-east-1
+        run: |
+          terragrunt stack run plan \
+            --filter-affected \
+            --feature deploy=${{ vars.GPU_ENABLED || 'true' }} \
+            -no-color
+
+      - name: Apply
+        working-directory: live/prod/us-east-1
+        run: |
+          terragrunt stack run apply \
+            --filter-affected \
+            --feature deploy=${{ vars.GPU_ENABLED || 'true' }} \
+            -auto-approve
