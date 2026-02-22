@@ -51,6 +51,18 @@ jobs:
       - name: Security scan
         run: checkov -d modules/ --framework terraform --quiet --compact
 
+      - name: Validate Terragrunt inputs
+        run: |
+          for dir in live/*/us-east-1/; do
+            echo "::group::validate-inputs - $dir"
+            cd "$GITHUB_WORKSPACE/$dir"
+            terragrunt stack generate
+            cd .terragrunt-stack
+            terragrunt run-all validate-inputs --terragrunt-non-interactive
+            cd "$GITHUB_WORKSPACE"
+            echo "::endgroup::"
+          done
+
   # -------------------------------------------------------
   # Job 2: Plan per environment (needs AWS credentials)
   # -------------------------------------------------------
@@ -69,6 +81,8 @@ jobs:
     steps:
       - name: Checkout
         uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
 
       - name: Setup tools
         uses: ./.github/actions/terragrunt-setup

@@ -12,6 +12,10 @@ permissions:
   id-token: write
   contents: read
 
+concurrency:
+  group: deploy-${{ github.ref }}
+  cancel-in-progress: false
+
 env:
   TG_PROVIDER_CACHE: "1"
 
@@ -26,6 +30,8 @@ jobs:
     steps:
       - name: Checkout
         uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
 
       - name: Setup tools
         uses: ./.github/actions/terragrunt-setup
@@ -50,7 +56,8 @@ jobs:
           terragrunt stack run apply \
             --filter-affected \
             --feature deploy=${{ vars.GPU_ENABLED || 'true' }} \
-            -auto-approve
+            -auto-approve \
+            -no-color
 
   # -------------------------------------------------------
   # Job 2: Deploy to prod (requires reviewer approval)
@@ -63,6 +70,8 @@ jobs:
     steps:
       - name: Checkout
         uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
 
       - name: Setup tools
         uses: ./.github/actions/terragrunt-setup
@@ -87,4 +96,5 @@ jobs:
           terragrunt stack run apply \
             --filter-affected \
             --feature deploy=${{ vars.GPU_ENABLED || 'true' }} \
-            -auto-approve
+            -auto-approve \
+            -no-color

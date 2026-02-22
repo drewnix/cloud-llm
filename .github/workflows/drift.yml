@@ -59,8 +59,11 @@ jobs:
           TITLE="Drift detected in ${ENV_NAME} - ${DATE}"
 
           # Build issue body with plan output
-          PLAN_OUTPUT=$(cat plan.txt)
-          BODY="## Drift Detected
+          PLAN_OUTPUT=$(cat "${{ matrix.working_directory }}/plan.txt")
+
+          # Write body to file to avoid shell argument length limits
+          cat > /tmp/issue-body.md <<ISSUE_EOF
+          ## Drift Detected
 
           Infrastructure state in the **${ENV_NAME}** environment does not match the code on \`main\` as of ${DATE}.
 
@@ -78,7 +81,11 @@ jobs:
           - If unintentional, re-apply from the Infrastructure Power workflow or run:
             \`\`\`
             cd ${WORKING_DIR} && terragrunt stack run apply
-            \`\`\`"
+            \`\`\`
+          ISSUE_EOF
+
+          # Strip leading whitespace from heredoc (YAML indentation)
+          sed -i 's/^          //' /tmp/issue-body.md
 
           # Check for existing open drift issue for this environment
           EXISTING=$(gh issue list \
@@ -90,12 +97,12 @@ jobs:
 
           if [ -n "$EXISTING" ]; then
             echo "Updating existing drift issue #${EXISTING}"
-            gh issue comment "$EXISTING" --body "$BODY"
+            gh issue comment "$EXISTING" --body-file /tmp/issue-body.md
           else
             echo "Creating new drift issue"
             gh issue create \
               --title "$TITLE" \
-              --body "$BODY" \
+              --body-file /tmp/issue-body.md \
               --label "drift,${ENV_NAME}"
           fi
 

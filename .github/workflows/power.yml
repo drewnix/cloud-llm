@@ -24,6 +24,10 @@ permissions:
   id-token: write
   contents: read
 
+concurrency:
+  group: power-${{ inputs.environment }}
+  cancel-in-progress: false
+
 env:
   TG_PROVIDER_CACHE: "1"
 
