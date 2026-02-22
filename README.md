@@ -1568,3 +1568,330 @@ This enables the AWS ruleset, which knows about every EC2 instance type, every R
 **`terragrunt validate-inputs`** checks the wiring layer. Remember the three-layer architecture: stacks pass `values` to units, units map those values to module `inputs`. If the stack passes `vpc_cidr` but the module expects a variable named `cidr_block`, Terraform will not catch this until `plan` time -- and even then, the error message can be cryptic. `validate-inputs` compares what the unit is sending against what the module declares and flags mismatches immediately. This is especially valuable when you add a new variable to a module and forget to update one of the unit templates.
 
 All four tools run without AWS credentials -- they are pure static analysis. This is why validation is a separate job in the PR workflow: it runs fast, costs nothing, and catches entire categories of errors before a plan ever touches the cloud.
+
+### The PR Workflow
+
+The PR workflow is the heaviest workflow in the pipeline -- it is where all validation happens before code reaches `main`. If something is wrong with your change, the PR workflow should catch it here, not after a merge. Reviewers should never have to approve a PR that has a red CI status.
+
+The workflow runs in two phases. The first phase, **validate**, is fast and needs no AWS credentials. It runs `terragrunt hclfmt`, tflint, checkov, and `validate-inputs` -- the same four tools from the section above. The second phase, **plan**, needs AWS credentials (obtained via OIDC) and runs once per environment in the matrix. It generates a Terraform plan and a cost estimate, then posts both as a PR comment so reviewers can see exactly what the change will do to infrastructure and what it will cost.
+
+This two-phase design means the cheap checks happen first. If you have a formatting issue or a security misconfiguration, you find out in under a minute -- before the plan job ever requests AWS credentials or runs `terraform init`. The plan job depends on validate (`needs: validate`), so it only runs if the static checks pass.
+
+```
+PR opened/updated
+    |
+    +-- Job: validate (no AWS creds)
+    |   +-- terragrunt hclfmt --check
+    |   +-- tflint (all modules/)
+    |   +-- checkov (all modules/)
+    |   +-- terragrunt validate-inputs
+    |
+    +-- Job: plan (OIDC creds, per environment)
+        +-- terragrunt stack run plan --filter-affected
+        +-- infracost diff
+        +-- Post PR comment (plan + cost)
+```
+
+Here is the full workflow file:
+
+```yaml
+# .github/workflows/pr.yml
+
+name: PR Validation & Plan
+
+on:
+  pull_request:
+    branches: [main]
+    paths:
+      - 'modules/**'
+      - 'units/**'
+      - 'live/**'
+
+permissions:
+  id-token: write
+  contents: read
+  pull-requests: write
+
+env:
+  TG_PROVIDER_CACHE: "1"
+
+jobs:
+  # -------------------------------------------------------
+  # Job 1: Static validation (no AWS credentials needed)
+  # -------------------------------------------------------
+  validate:
+    name: Validate
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup tools
+        uses: ./.github/actions/terragrunt-setup
+
+      - name: Check HCL formatting
+        run: terragrunt hclfmt --check
+
+      - name: Init tflint
+        run: tflint --init --config "$GITHUB_WORKSPACE/.tflint.hcl"
+
+      - name: Lint Terraform modules
+        run: |
+          exit_code=0
+          for dir in modules/*/; do
+            echo "::group::tflint - $dir"
+            if ! tflint --config "$GITHUB_WORKSPACE/.tflint.hcl" "$dir"; then
+              exit_code=1
+            fi
+            echo "::endgroup::"
+          done
+          exit $exit_code
+
+      - name: Security scan
+        run: checkov -d modules/ --framework terraform --quiet --compact
+
+  # -------------------------------------------------------
+  # Job 2: Plan per environment (needs AWS credentials)
+  # -------------------------------------------------------
+  plan:
+    name: Plan (${{ matrix.environment }})
+    runs-on: ubuntu-latest
+    needs: validate
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - environment: dev
+            working_directory: live/dev/us-east-1
+          - environment: prod
+            working_directory: live/prod/us-east-1
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup tools
+        uses: ./.github/actions/terragrunt-setup
+
+      - name: Configure AWS credentials (OIDC)
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ vars.AWS_ROLE_ARN }}
+          aws-region: us-east-1
+
+      - name: Terragrunt plan
+        id: plan
+        working-directory: ${{ matrix.working_directory }}
+        continue-on-error: true
+        run: |
+          set -o pipefail
+          terragrunt stack run plan --filter-affected -no-color 2>&1 | tee plan.txt
+          echo "exitcode=${PIPESTATUS[0]}" >> "$GITHUB_OUTPUT"
+
+      - name: Setup Infracost
+        uses: infracost/actions/setup@v3
+        with:
+          api-key: ${{ secrets.INFRACOST_API_KEY }}
+
+      - name: Generate cost estimate
+        id: infracost
+        working-directory: ${{ matrix.working_directory }}
+        continue-on-error: true
+        run: |
+          infracost breakdown \
+            --path ".terragrunt-stack" \
+            --format json \
+            --out-file infracost.json
+          infracost output \
+            --path infracost.json \
+            --format github-comment \
+            --out-file infracost-comment.txt
+
+      - name: Build PR comment
+        id: comment
+        run: |
+          {
+            echo "### Terragrunt Plan: \`${{ matrix.environment }}\`"
+            echo ""
+            echo "<details>"
+            echo "<summary>Plan output (click to expand)</summary>"
+            echo ""
+            echo '```'
+            cat "${{ matrix.working_directory }}/plan.txt"
+            echo '```'
+            echo ""
+            echo "</details>"
+            echo ""
+            if [ -f "${{ matrix.working_directory }}/infracost-comment.txt" ]; then
+              echo "#### Cost Estimate"
+              echo ""
+              cat "${{ matrix.working_directory }}/infracost-comment.txt"
+            fi
+          } > comment.md
+
+      - name: Post PR comment
+        uses: marocchino/sticky-pull-request-comment@v2
+        with:
+          header: plan-${{ matrix.environment }}
+          path: comment.md
+
+      - name: Fail if plan errored
+        if: steps.plan.outputs.exitcode == '1'
+        run: exit 1
+```
+
+Let's walk through the key pieces.
+
+**`on.pull_request.paths`** -- The workflow only triggers when files under `modules/`, `units/`, or `live/` change. A README edit, a CI script tweak, or a documentation update does not spin up the pipeline. This saves CI minutes and reduces noise -- your team does not get pinged with plan comments on a typo fix.
+
+**`permissions`** -- Three permissions, each for a specific purpose. `id-token: write` enables OIDC authentication -- the workflow proves its identity to AWS without storing long-lived access keys as secrets. This is the same authentication pattern described in the Prerequisites section. `contents: read` allows checking out the repository code. `pull-requests: write` allows the workflow to post plan comments on the PR. If you forget `pull-requests: write`, the plan runs fine but the comment step fails silently.
+
+**`TG_PROVIDER_CACHE: "1"`** -- This is the environment variable equivalent of the `--provider-cache` flag from Part 7's Provider Cache section. Setting it as a workflow-level environment variable means every Terragrunt command in every job gets provider caching automatically. Without it, each unit in the stack would download its own copy of the AWS provider plugin, wasting time and bandwidth. With it, the provider is downloaded once and shared across all units.
+
+**The validate job** runs without AWS credentials -- it never calls `aws-actions/configure-aws-credentials`. Each step catches a different category of error: formatting (hclfmt), Terraform-specific issues (tflint), security misconfigurations (checkov). The `for dir in modules/*/` loop runs tflint against each module independently rather than as a single invocation. This means a lint error in the VPC module does not prevent linting the ALB module. The `::group::` and `::endgroup::` markers create collapsible sections in the GitHub Actions log, so the output stays organized even with 8 modules.
+
+**The plan job matrix** uses `fail-fast: false`, which means both environments get planned even if one fails. This is important: a failure in the dev plan should not prevent you from seeing the prod plan. During early development especially, one environment might fail (maybe the VPC does not exist yet) while the other succeeds. The matrix includes both the environment name (for display in the job title and PR comment header) and the working directory (for the Terragrunt commands). The `needs: validate` dependency ensures plans only run after static validation passes.
+
+**`continue-on-error: true` on the plan step** lets the workflow continue to the comment-posting steps even when the plan itself fails. This is a deliberate design choice. Without it, a plan failure would skip the PR comment steps, and the reviewer would have to dig through the raw workflow logs to understand what went wrong. With `continue-on-error`, the plan failure gets captured in `plan.txt`, packaged into a formatted PR comment, and posted for the reviewer to read directly on the PR. The explicit "Fail if plan errored" step at the end of the job checks `steps.plan.outputs.exitcode` and exits non-zero, so the job still reports failure in the GitHub status check. You get the best of both worlds: the reviewer sees the error inline, and the PR shows a red check.
+
+**The Infracost steps** generate a cost estimate alongside the plan. `infracost breakdown` reads the plan files from the `.terragrunt-stack` directory (where Terragrunt generates its working files) and produces a JSON cost estimate. `infracost output` converts that JSON into a GitHub-flavored markdown comment. The cost estimate appears in the PR comment alongside the plan, so reviewers see both what changes and what it costs. If you change an instance type from `g5.xlarge` to `g5.2xlarge`, the cost estimate shows the monthly delta. The `continue-on-error: true` on this step means a missing Infracost API key or a parsing error does not block the plan comment from posting -- cost is informational, not a gate.
+
+**`marocchino/sticky-pull-request-comment`** is the action that posts the PR comment. The `header` parameter (`plan-dev` or `plan-prod`) is the key: it tells the action to update the same comment on each push to the PR rather than creating a new one. Without this, every push would create a new comment, and a PR with 10 pushes would have 20 plan comments (one dev + one prod per push), burying the conversation in noise. The sticky behavior means there are always exactly two plan comments on the PR -- one for dev, one for prod -- and they always show the latest plan.
+
+**Required status checks** -- The validate job should be configured as a required status check in your repository's branch protection rules (Settings > Branches > Branch protection rules > Require status checks). This prevents merging a PR that has formatting issues, lint errors, or security findings. The plan job is informational -- it posts output for reviewers but should not block merge. During early development, before all dependencies exist, plan failures are expected. A new module might reference a VPC that has not been created yet. The plan comment helps reviewers understand the scope of the change; the validate check ensures code quality.
+
+### The Deploy Workflow
+
+Once a PR is merged, the deploy workflow takes over. It applies changes to dev automatically and gates prod behind a reviewer approval. There is no manual `terragrunt apply` from someone's laptop -- the merge to `main` is the trigger, and every deployment is traceable to a specific commit and PR in the git history.
+
+This is the core of the GitOps model you have been building toward. The infrastructure code is the source of truth. A pull request proposes a change, the PR workflow shows the plan, reviewers approve, the merge triggers the deploy. If something breaks, you revert the commit. If you want to know what changed and when, you read the git log. No more "who ran apply and from where?"
+
+The two-job structure -- dev then prod -- means dev always gets changes first. If something breaks in dev, prod is protected. The `needs: deploy-dev` dependency enforces this ordering: prod never runs unless dev succeeds. This is a lightweight soak period -- your changes prove themselves in dev before reaching production.
+
+```
+Push to main
+    |
+    +-- Job: deploy-dev
+    |   +-- environment: dev (no approval gate)
+    |   +-- terragrunt stack run plan --filter-affected
+    |   +-- terragrunt stack run apply --filter-affected
+    |
+    +-- Job: deploy-prod
+        +-- environment: prod (required reviewer)
+        +-- Workflow pauses -> reviewer gets notification
+        +-- Reviewer approves in GitHub UI
+        +-- terragrunt stack run plan --filter-affected
+        +-- terragrunt stack run apply --filter-affected
+```
+
+Here is the full workflow file:
+
+```yaml
+# .github/workflows/deploy.yml
+
+name: Deploy
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - 'modules/**'
+      - 'units/**'
+      - 'live/**'
+
+permissions:
+  id-token: write
+  contents: read
+
+env:
+  TG_PROVIDER_CACHE: "1"
+
+jobs:
+  # -------------------------------------------------------
+  # Job 1: Deploy to dev (no approval gate)
+  # -------------------------------------------------------
+  deploy-dev:
+    name: Deploy Dev
+    runs-on: ubuntu-latest
+    environment: dev
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup tools
+        uses: ./.github/actions/terragrunt-setup
+
+      - name: Configure AWS credentials (OIDC)
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ vars.AWS_ROLE_ARN }}
+          aws-region: us-east-1
+
+      - name: Plan
+        working-directory: live/dev/us-east-1
+        run: |
+          terragrunt stack run plan \
+            --filter-affected \
+            --feature deploy=${{ vars.GPU_ENABLED || 'true' }} \
+            -no-color
+
+      - name: Apply
+        working-directory: live/dev/us-east-1
+        run: |
+          terragrunt stack run apply \
+            --filter-affected \
+            --feature deploy=${{ vars.GPU_ENABLED || 'true' }} \
+            -auto-approve
+
+  # -------------------------------------------------------
+  # Job 2: Deploy to prod (requires reviewer approval)
+  # -------------------------------------------------------
+  deploy-prod:
+    name: Deploy Prod
+    runs-on: ubuntu-latest
+    needs: deploy-dev
+    environment: prod
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup tools
+        uses: ./.github/actions/terragrunt-setup
+
+      - name: Configure AWS credentials (OIDC)
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ vars.AWS_ROLE_ARN }}
+          aws-region: us-east-1
+
+      - name: Plan
+        working-directory: live/prod/us-east-1
+        run: |
+          terragrunt stack run plan \
+            --filter-affected \
+            --feature deploy=${{ vars.GPU_ENABLED || 'true' }} \
+            -no-color
+
+      - name: Apply
+        working-directory: live/prod/us-east-1
+        run: |
+          terragrunt stack run apply \
+            --filter-affected \
+            --feature deploy=${{ vars.GPU_ENABLED || 'true' }} \
+            -auto-approve
+```
+
+Let's walk through the key pieces.
+
+**`on.push.branches: [main]`** -- The workflow triggers on pushes to `main`, which means merges from pull requests. It does not run on feature branches. The same `paths` filter from the PR workflow is here too: only changes to `modules/`, `units/`, or `live/` trigger a deploy. This means merging a documentation-only PR does not kick off an unnecessary apply cycle.
+
+**`environment: dev` and `environment: prod`** -- These link each job to the GitHub Environments you configured in the Prerequisites section. When a job specifies `environment: dev`, GitHub does two things: it injects that environment's variables (like `AWS_ROLE_ARN` and `GPU_ENABLED`) and it enforces that environment's protection rules. The `dev` environment has no protection rules, so `deploy-dev` runs immediately after checkout. The `prod` environment has a required reviewer, so `deploy-prod` pauses the moment it starts and sends a notification to the designated reviewer. The workflow does not contain any conditional logic to implement this gate -- the environment protection rule handles it entirely.
+
+**`needs: deploy-dev`** -- Prod depends on dev succeeding. If `deploy-dev` fails, `deploy-prod` never runs. This is the soak step: changes prove themselves in dev before reaching prod. If a module change causes an apply error in dev (maybe a new resource conflicts with an existing one, or an API call fails), prod is protected. You fix the issue, push another commit, and the pipeline runs again.
+
+**`${{ vars.GPU_ENABLED || 'true' }}`** -- This reads the `GPU_ENABLED` variable from the GitHub Environment. It defaults to `true` if the variable is not set. This ties directly into the power switch workflow you will see later: if you set `GPU_ENABLED=false` in the environment settings, deploys will skip the GPU instance. The `--feature deploy=...` flag maps to the `feature "deploy"` block in the ec2-gpu unit template from Part 3. When `deploy` is `false`, the ec2-gpu unit is excluded from the stack -- no instance is created, no cost is incurred. When `deploy` is `true` (the default), the full stack deploys including the GPU instance.
+
+**Plan before apply** -- Each job runs `terragrunt stack run plan` before `terragrunt stack run apply`. The plan step is not strictly required (apply would generate a plan internally), but running it explicitly serves two purposes. First, the plan output appears in the workflow logs, giving anyone reviewing the deployment visibility into exactly what was applied. Second, if something looks wrong in the plan, the reviewer who approved the prod deployment can cancel the workflow run before the apply step starts.
+
+**`-auto-approve`** -- Terraform's `apply` command normally prompts "Do you want to perform these actions?" and waits for you to type `yes`. In CI, there is no interactive terminal, so `-auto-approve` skips that prompt. This is safe because the approval gate is not the Terraform prompt -- it is the GitHub Environment protection rule. For dev, the gate is the PR review (you merged to main, so someone already reviewed the change). For prod, the gate is the environment reviewer who must explicitly approve the deployment in the GitHub UI.
+
+**The reviewer experience** -- Here is what happens from the reviewer's perspective when a PR is merged. The deploy workflow starts. `deploy-dev` runs immediately -- it plans and applies to dev. If it succeeds, `deploy-prod` starts, but immediately pauses because the `prod` environment has a required reviewer. The designated reviewer gets a GitHub notification (email, mobile, or in the GitHub UI depending on their settings). They click through to the workflow run, where they can see the `deploy-dev` logs (including the plan and apply output) to verify the change worked in dev. The `deploy-prod` job shows a yellow "Waiting" badge. The reviewer clicks "Review deployments", selects the `prod` environment, and clicks "Approve and deploy." The job resumes, runs the prod plan and apply, and the deployment is complete. If something looks wrong in the dev logs, the reviewer clicks "Reject" instead, and prod is never touched.
