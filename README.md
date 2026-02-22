@@ -1667,6 +1667,18 @@ jobs:
       - name: Security scan
         run: checkov -d modules/ --framework terraform --quiet --compact
 
+      - name: Validate Terragrunt inputs
+        run: |
+          for dir in live/*/us-east-1/; do
+            echo "::group::validate-inputs - $dir"
+            cd "$GITHUB_WORKSPACE/$dir"
+            terragrunt stack generate
+            cd .terragrunt-stack
+            terragrunt run-all validate-inputs --terragrunt-non-interactive
+            cd "$GITHUB_WORKSPACE"
+            echo "::endgroup::"
+          done
+
   # -------------------------------------------------------
   # Job 2: Plan per environment (needs AWS credentials)
   # -------------------------------------------------------
@@ -1685,6 +1697,8 @@ jobs:
     steps:
       - name: Checkout
         uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
 
       - name: Setup tools
         uses: ./.github/actions/terragrunt-setup
@@ -1764,7 +1778,7 @@ Let's walk through the key pieces.
 
 **`TG_PROVIDER_CACHE: "1"`** -- This is the environment variable equivalent of the `--provider-cache` flag from Part 7's Provider Cache section. Setting it as a workflow-level environment variable means every Terragrunt command in every job gets provider caching automatically. Without it, each unit in the stack would download its own copy of the AWS provider plugin, wasting time and bandwidth. With it, the provider is downloaded once and shared across all units.
 
-**The validate job** runs without AWS credentials -- it never calls `aws-actions/configure-aws-credentials`. Each step catches a different category of error: formatting (hclfmt), Terraform-specific issues (tflint), security misconfigurations (checkov). The `for dir in modules/*/` loop runs tflint against each module independently rather than as a single invocation. This means a lint error in the VPC module does not prevent linting the ALB module. The `::group::` and `::endgroup::` markers create collapsible sections in the GitHub Actions log, so the output stays organized even with 8 modules.
+**The validate job** runs without AWS credentials -- it never calls `aws-actions/configure-aws-credentials`. Each step catches a different category of error: formatting (hclfmt), Terraform-specific issues (tflint), security misconfigurations (checkov), and wiring mismatches (validate-inputs). The `for dir in modules/*/` loop runs tflint against each module independently rather than as a single invocation. This means a lint error in the VPC module does not prevent linting the ALB module. The `::group::` and `::endgroup::` markers create collapsible sections in the GitHub Actions log, so the output stays organized even with 8 modules. The final `validate-inputs` step iterates over every environment directory, generates the stack, and runs `terragrunt run-all validate-inputs` to verify that the values each unit passes match what the corresponding Terraform module expects. This catches wiring bugs -- like a stack passing `vpc_cidr` when the module expects `cidr_block` -- before a plan ever touches AWS.
 
 **The plan job matrix** uses `fail-fast: false`, which means both environments get planned even if one fails. This is important: a failure in the dev plan should not prevent you from seeing the prod plan. During early development especially, one environment might fail (maybe the VPC does not exist yet) while the other succeeds. The matrix includes both the environment name (for display in the job title and PR comment header) and the working directory (for the Terragrunt commands). The `needs: validate` dependency ensures plans only run after static validation passes.
 
@@ -1819,6 +1833,10 @@ permissions:
   id-token: write
   contents: read
 
+concurrency:
+  group: deploy-${{ github.ref }}
+  cancel-in-progress: false
+
 env:
   TG_PROVIDER_CACHE: "1"
 
@@ -1833,6 +1851,8 @@ jobs:
     steps:
       - name: Checkout
         uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
 
       - name: Setup tools
         uses: ./.github/actions/terragrunt-setup
@@ -1857,7 +1877,8 @@ jobs:
           terragrunt stack run apply \
             --filter-affected \
             --feature deploy=${{ vars.GPU_ENABLED || 'true' }} \
-            -auto-approve
+            -auto-approve \
+            -no-color
 
   # -------------------------------------------------------
   # Job 2: Deploy to prod (requires reviewer approval)
@@ -1870,6 +1891,8 @@ jobs:
     steps:
       - name: Checkout
         uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
 
       - name: Setup tools
         uses: ./.github/actions/terragrunt-setup
@@ -1894,12 +1917,15 @@ jobs:
           terragrunt stack run apply \
             --filter-affected \
             --feature deploy=${{ vars.GPU_ENABLED || 'true' }} \
-            -auto-approve
+            -auto-approve \
+            -no-color
 ```
 
 Let's walk through the key pieces.
 
 **`on.push.branches: [main]`** -- The workflow triggers on pushes to `main`, which means merges from pull requests. It does not run on feature branches. The same `paths` filter from the PR workflow is here too: only changes to `modules/`, `units/`, or `live/` trigger a deploy. This means merging a documentation-only PR does not kick off an unnecessary apply cycle.
+
+**`concurrency`** -- The `concurrency` block with `group: deploy-${{ github.ref }}` prevents parallel deploys from racing. If two PRs merge to `main` in quick succession, the second deploy workflow will wait for the first to finish rather than running simultaneously. Without this, two concurrent `terragrunt stack run apply` invocations could attempt to modify the same Terraform state at the same time, leading to state lock conflicts or, worse, interleaved resource changes that leave infrastructure in an inconsistent state. The `cancel-in-progress: false` setting ensures the first deploy runs to completion rather than being cancelled by the second -- you never want a half-applied infrastructure change.
 
 **`environment: dev` and `environment: prod`** -- These link each job to the GitHub Environments you configured in the Prerequisites section. When a job specifies `environment: dev`, GitHub does two things: it injects that environment's variables (like `AWS_ROLE_ARN` and `GPU_ENABLED`) and it enforces that environment's protection rules. The `dev` environment has no protection rules, so `deploy-dev` runs immediately after checkout. The `prod` environment has a required reviewer, so `deploy-prod` pauses the moment it starts and sends a notification to the designated reviewer. The workflow does not contain any conditional logic to implement this gate -- the environment protection rule handles it entirely.
 
@@ -1987,8 +2013,11 @@ jobs:
           TITLE="Drift detected in ${ENV_NAME} - ${DATE}"
 
           # Build issue body with plan output
-          PLAN_OUTPUT=$(cat plan.txt)
-          BODY="## Drift Detected
+          PLAN_OUTPUT=$(cat "${{ matrix.working_directory }}/plan.txt")
+
+          # Write body to file to avoid shell argument length limits
+          cat > /tmp/issue-body.md <<ISSUE_EOF
+          ## Drift Detected
 
           Infrastructure state in the **${ENV_NAME}** environment does not match the code on \`main\` as of ${DATE}.
 
@@ -2006,7 +2035,11 @@ jobs:
           - If unintentional, re-apply from the Infrastructure Power workflow or run:
             \`\`\`
             cd ${WORKING_DIR} && terragrunt stack run apply
-            \`\`\`"
+            \`\`\`
+          ISSUE_EOF
+
+          # Strip leading whitespace from heredoc (YAML indentation)
+          sed -i 's/^          //' /tmp/issue-body.md
 
           # Check for existing open drift issue for this environment
           EXISTING=$(gh issue list \
@@ -2018,12 +2051,12 @@ jobs:
 
           if [ -n "$EXISTING" ]; then
             echo "Updating existing drift issue #${EXISTING}"
-            gh issue comment "$EXISTING" --body "$BODY"
+            gh issue comment "$EXISTING" --body-file /tmp/issue-body.md
           else
             echo "Creating new drift issue"
             gh issue create \
               --title "$TITLE" \
-              --body "$BODY" \
+              --body-file /tmp/issue-body.md \
               --label "drift,${ENV_NAME}"
           fi
 
@@ -2046,7 +2079,7 @@ Let's walk through the key pieces.
 
 **`-detailed-exitcode`** -- Terraform uses exit codes to communicate plan results: `0` means no changes (infrastructure matches code exactly), `1` means an error occurred (authentication failure, API error, invalid configuration), and `2` means changes were detected (drift). This is how the workflow distinguishes between "everything is fine" and "something changed." The `continue-on-error: true` on the plan step prevents the workflow from stopping on exit code 2, and the `PIPESTATUS[0]` captures the real exit code through the `tee` pipe so the subsequent steps can branch on it.
 
-**The issue creation logic** -- When drift is detected (exit code 2), the workflow uses `gh issue list` to check for an existing open issue labeled with both `drift` and the environment name (e.g., `drift,dev`). If one exists, it adds a comment with the new plan output -- this avoids creating duplicate issues when drift persists across multiple runs. If no existing issue is found, it creates a new one. The plan output is wrapped in a `<details>` block so it does not overwhelm the issue tracker with hundreds of lines of Terraform output. Readers click to expand when they want the details.
+**The issue creation logic** -- When drift is detected (exit code 2), the workflow uses `gh issue list` to check for an existing open issue labeled with both `drift` and the environment name (e.g., `drift,dev`). If one exists, it adds a comment with the new plan output -- this avoids creating duplicate issues when drift persists across multiple runs. If no existing issue is found, it creates a new one. The plan output is wrapped in a `<details>` block so it does not overwhelm the issue tracker with hundreds of lines of Terraform output. Readers click to expand when they want the details. The issue body is written to a temporary file (`/tmp/issue-body.md`) and passed to `gh issue create` and `gh issue comment` via `--body-file` rather than `--body`. This avoids shell argument length limits -- a large plan output with dozens of resource changes can easily exceed the maximum argument size that the shell allows, which would silently truncate the issue body or cause the command to fail entirely.
 
 **The error handling step** -- Exit code 1 (plan error) gets its own step that emits a `::error::` annotation and exits non-zero. This marks the workflow run as failed in the GitHub Actions UI, which is distinct from drift detection. Drift (exit code 2) is an expected outcome that creates an issue; an error (exit code 1) is something wrong with the plan itself -- maybe the OIDC credentials expired, or a provider API is down. You want to know about both, but through different channels.
 
@@ -2098,6 +2131,10 @@ on:
 permissions:
   id-token: write
   contents: read
+
+concurrency:
+  group: power-${{ inputs.environment }}
+  cancel-in-progress: false
 
 env:
   TG_PROVIDER_CACHE: "1"
