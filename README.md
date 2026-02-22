@@ -1895,3 +1895,308 @@ Let's walk through the key pieces.
 **`-auto-approve`** -- Terraform's `apply` command normally prompts "Do you want to perform these actions?" and waits for you to type `yes`. In CI, there is no interactive terminal, so `-auto-approve` skips that prompt. This is safe because the approval gate is not the Terraform prompt -- it is the GitHub Environment protection rule. For dev, the gate is the PR review (you merged to main, so someone already reviewed the change). For prod, the gate is the environment reviewer who must explicitly approve the deployment in the GitHub UI.
 
 **The reviewer experience** -- Here is what happens from the reviewer's perspective when a PR is merged. The deploy workflow starts. `deploy-dev` runs immediately -- it plans and applies to dev. If it succeeds, `deploy-prod` starts, but immediately pauses because the `prod` environment has a required reviewer. The designated reviewer gets a GitHub notification (email, mobile, or in the GitHub UI depending on their settings). They click through to the workflow run, where they can see the `deploy-dev` logs (including the plan and apply output) to verify the change worked in dev. The `deploy-prod` job shows a yellow "Waiting" badge. The reviewer clicks "Review deployments", selects the `prod` environment, and clicks "Approve and deploy." The job resumes, runs the prod plan and apply, and the deployment is complete. If something looks wrong in the dev logs, the reviewer clicks "Reject" instead, and prod is never touched.
+
+### Drift Detection
+
+Infrastructure drift happens when the real state of your resources diverges from what the code defines. The causes are varied and sometimes subtle: someone logs into the AWS console and tweaks a security group rule to fix an urgent issue, an auto-scaling event modifies a resource outside of Terraform's control, or a provider upgrade changes default behavior on a resource you thought was stable. Any of these scenarios leaves your infrastructure in a state that no longer matches the code on `main`.
+
+Without active detection, drift is invisible. Everything looks fine in your repository -- the code has not changed, the last deploy succeeded, the PR history is clean. Then one day you run `terragrunt plan` and discover 14 unexpected changes, and you have no idea when they happened or why. A nightly plan is a smoke alarm. It runs against your live infrastructure on a schedule and tells you the moment reality stops matching your code. You find out about drift in a GitHub Issue the next morning, not during a production incident three weeks later.
+
+The drift workflow runs `terragrunt stack run plan` against every unit in an environment. If the plan shows changes -- meaning the real infrastructure differs from what the code defines -- the workflow opens a GitHub Issue with the plan output so the team can investigate. If no changes are detected, the workflow exits silently. You only hear about problems.
+
+Here is the full workflow file:
+
+```yaml
+# .github/workflows/drift.yml
+
+name: Drift Detection
+
+on:
+  schedule:
+    - cron: '0 6 * * *'   # Daily at 6am UTC
+  workflow_dispatch:        # Allow manual trigger
+
+permissions:
+  id-token: write
+  contents: read
+  issues: write
+
+env:
+  TG_PROVIDER_CACHE: "1"
+
+jobs:
+  detect-drift:
+    name: Drift Check (${{ matrix.environment }})
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - environment: dev
+            working_directory: live/dev/us-east-1
+          - environment: prod
+            working_directory: live/prod/us-east-1
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup tools
+        uses: ./.github/actions/terragrunt-setup
+
+      - name: Configure AWS credentials (OIDC)
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ vars.AWS_ROLE_ARN }}
+          aws-region: us-east-1
+
+      - name: Terragrunt plan (detect drift)
+        id: plan
+        working-directory: ${{ matrix.working_directory }}
+        continue-on-error: true
+        run: |
+          set -o pipefail
+          terragrunt stack run plan -no-color -detailed-exitcode 2>&1 | tee plan.txt
+          echo "exitcode=${PIPESTATUS[0]}" >> "$GITHUB_OUTPUT"
+
+      # Exit code 0 = no changes, 1 = error, 2 = changes detected (drift)
+      - name: Open or update drift issue
+        if: steps.plan.outputs.exitcode == '2'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          ENV_NAME: ${{ matrix.environment }}
+          WORKING_DIR: ${{ matrix.working_directory }}
+        run: |
+          DATE=$(date +%Y-%m-%d)
+          TITLE="Drift detected in ${ENV_NAME} - ${DATE}"
+
+          # Build issue body with plan output
+          PLAN_OUTPUT=$(cat plan.txt)
+          BODY="## Drift Detected
+
+          Infrastructure state in the **${ENV_NAME}** environment does not match the code on \`main\` as of ${DATE}.
+
+          <details>
+          <summary>Plan output (click to expand)</summary>
+
+          \`\`\`
+          ${PLAN_OUTPUT}
+          \`\`\`
+
+          </details>
+
+          **Next steps:**
+          - If the drift is intentional (e.g., manual scaling), update the code to match.
+          - If unintentional, re-apply from the Infrastructure Power workflow or run:
+            \`\`\`
+            cd ${WORKING_DIR} && terragrunt stack run apply
+            \`\`\`"
+
+          # Check for existing open drift issue for this environment
+          EXISTING=$(gh issue list \
+            --label "drift,${ENV_NAME}" \
+            --state open \
+            --limit 1 \
+            --json number \
+            -q '.[0].number')
+
+          if [ -n "$EXISTING" ]; then
+            echo "Updating existing drift issue #${EXISTING}"
+            gh issue comment "$EXISTING" --body "$BODY"
+          else
+            echo "Creating new drift issue"
+            gh issue create \
+              --title "$TITLE" \
+              --body "$BODY" \
+              --label "drift,${ENV_NAME}"
+          fi
+
+      - name: No drift detected
+        if: steps.plan.outputs.exitcode == '0'
+        run: echo "No drift detected in ${{ matrix.environment }}"
+
+      - name: Plan error
+        if: steps.plan.outputs.exitcode == '1'
+        run: |
+          echo "::error::Plan failed for ${{ matrix.environment }} -- check logs"
+          exit 1
+```
+
+Let's walk through the key pieces.
+
+**`schedule` and `workflow_dispatch`** -- The workflow runs on a cron schedule: daily at 6am UTC. This means every morning when you check GitHub, any drift that occurred overnight is already waiting as an issue. The `workflow_dispatch` trigger lets you run it manually at any time. This is useful after a known console change -- if someone manually adjusted a security group rule to unblock a deployment, you can immediately check whether the fix introduced drift and then update the code to match.
+
+**No `--filter-affected`** -- Notice that this workflow runs a plain `terragrunt stack run plan` without the `--filter-affected` flag you saw in the PR and deploy workflows. This is deliberate. The `--filter-affected` flag limits the plan to units affected by recent code changes. But drift detection is not about code changes -- it is about catching changes that happened *outside* of code. Someone modifying a security group in the AWS console would never show up in `--filter-affected` because no `.hcl` or `.tf` file changed. Drift detection needs to plan against everything.
+
+**`-detailed-exitcode`** -- Terraform uses exit codes to communicate plan results: `0` means no changes (infrastructure matches code exactly), `1` means an error occurred (authentication failure, API error, invalid configuration), and `2` means changes were detected (drift). This is how the workflow distinguishes between "everything is fine" and "something changed." The `continue-on-error: true` on the plan step prevents the workflow from stopping on exit code 2, and the `PIPESTATUS[0]` captures the real exit code through the `tee` pipe so the subsequent steps can branch on it.
+
+**The issue creation logic** -- When drift is detected (exit code 2), the workflow uses `gh issue list` to check for an existing open issue labeled with both `drift` and the environment name (e.g., `drift,dev`). If one exists, it adds a comment with the new plan output -- this avoids creating duplicate issues when drift persists across multiple runs. If no existing issue is found, it creates a new one. The plan output is wrapped in a `<details>` block so it does not overwhelm the issue tracker with hundreds of lines of Terraform output. Readers click to expand when they want the details.
+
+**The error handling step** -- Exit code 1 (plan error) gets its own step that emits a `::error::` annotation and exits non-zero. This marks the workflow run as failed in the GitHub Actions UI, which is distinct from drift detection. Drift (exit code 2) is an expected outcome that creates an issue; an error (exit code 1) is something wrong with the plan itself -- maybe the OIDC credentials expired, or a provider API is down. You want to know about both, but through different channels.
+
+**Tuning the schedule** -- The daily cron (`'0 6 * * *'`) suits active development where infrastructure changes frequently. For stable production environments that rarely change, a weekly check may be enough. Adjust the cron expression to match your needs: `'0 6 * * 1'` for Mondays only, `'0 6 * * 1-5'` for weekdays, or `'0 6 1 * *'` for the first day of each month. You can also set different schedules per environment by splitting the matrix into separate jobs with separate cron triggers.
+
+### Infrastructure Power Switch
+
+GPU instances cost roughly $1 per hour on-demand. For a tutorial project that you use a few hours a week, leaving infrastructure running 24/7 wastes hundreds of dollars a month. You need a way to turn things on and off without SSH-ing into a machine or running Terragrunt commands from your laptop.
+
+The power switch is a `workflow_dispatch` workflow with dropdown menus in the GitHub Actions UI. You navigate to Actions, select the "Infrastructure Power" workflow, pick an environment from one dropdown, pick an action from another, and click "Run workflow." No CLI, no AWS console, no Terraform knowledge required. Anyone on the team can manage infrastructure costs.
+
+Three power tiers map to different cost profiles:
+
+| Mode | What Happens | Ongoing Cost | Restart Time |
+|---|---|---|---|
+| **full-on** | Everything running, GPU active | ~$1/hr+ | -- |
+| **standby** | GPU destroyed, networking stays | ~$50/mo | ~5 min |
+| **full-off** | Entire environment destroyed | $0 | ~10-15 min |
+
+For tutorial readers, **full-off is the recommended default**. When you are done working for the day, run `full-off` and your ongoing cost drops to zero. Standby is useful during active development days when you are iterating on the model serving configuration and want fast GPU restarts without waiting for the VPC, ALB, and DNS to recreate. Full-on is for when you are actively using the infrastructure.
+
+Here is the full workflow file:
+
+```yaml
+# .github/workflows/power.yml
+
+name: Infrastructure Power
+
+on:
+  workflow_dispatch:
+    inputs:
+      environment:
+        description: 'Target environment'
+        required: true
+        type: choice
+        options:
+          - dev
+          - prod
+      action:
+        description: 'Power action'
+        required: true
+        type: choice
+        options:
+          - plan-only
+          - full-on
+          - standby
+          - full-off
+
+permissions:
+  id-token: write
+  contents: read
+
+env:
+  TG_PROVIDER_CACHE: "1"
+
+jobs:
+  power:
+    name: "${{ inputs.action }} (${{ inputs.environment }})"
+    runs-on: ubuntu-latest
+    environment: ${{ inputs.environment }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup tools
+        uses: ./.github/actions/terragrunt-setup
+
+      - name: Configure AWS credentials (OIDC)
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ vars.AWS_ROLE_ARN }}
+          aws-region: us-east-1
+
+      - name: Set working directory
+        id: dir
+        run: echo "path=live/${{ inputs.environment }}/us-east-1" >> "$GITHUB_OUTPUT"
+
+      # ---- Plan Only ----
+      - name: Plan
+        if: inputs.action == 'plan-only'
+        working-directory: ${{ steps.dir.outputs.path }}
+        run: terragrunt stack run plan -no-color
+
+      # ---- Full On: apply entire stack with GPU ----
+      - name: Full On
+        if: inputs.action == 'full-on'
+        working-directory: ${{ steps.dir.outputs.path }}
+        run: |
+          terragrunt stack run apply \
+            --feature deploy=true \
+            -auto-approve
+
+      # ---- Standby: GPU off, networking stays ----
+      - name: Standby
+        if: inputs.action == 'standby'
+        working-directory: ${{ steps.dir.outputs.path }}
+        run: |
+          terragrunt stack run apply \
+            --feature deploy=false \
+            -auto-approve
+
+      # ---- Full Off: destroy entire environment ----
+      - name: Full Off
+        if: inputs.action == 'full-off'
+        working-directory: ${{ steps.dir.outputs.path }}
+        run: |
+          terragrunt stack run destroy -auto-approve
+
+      - name: Summary
+        run: |
+          echo "## Infrastructure Power: ${{ inputs.action }}" >> "$GITHUB_STEP_SUMMARY"
+          echo "" >> "$GITHUB_STEP_SUMMARY"
+          echo "**Environment:** ${{ inputs.environment }}" >> "$GITHUB_STEP_SUMMARY"
+          echo "**Action:** ${{ inputs.action }}" >> "$GITHUB_STEP_SUMMARY"
+          echo "" >> "$GITHUB_STEP_SUMMARY"
+          case "${{ inputs.action }}" in
+            full-on)  echo "All infrastructure is running. GPU instance is active." >> "$GITHUB_STEP_SUMMARY" ;;
+            standby)  echo "GPU instance destroyed. Networking, ALB, DNS remain (~\$50/mo)." >> "$GITHUB_STEP_SUMMARY" ;;
+            full-off) echo "All infrastructure destroyed. Zero ongoing cost." >> "$GITHUB_STEP_SUMMARY" ;;
+            plan-only) echo "No changes applied. Review the plan output above." >> "$GITHUB_STEP_SUMMARY" ;;
+          esac
+```
+
+Let's walk through the key pieces.
+
+**`workflow_dispatch.inputs`** -- The `type: choice` parameter creates dropdown menus in the GitHub Actions UI. When you click "Run workflow" on this workflow, you see two dropdowns instead of free-text fields. This prevents typos -- you cannot accidentally type "devv" or "prod " with a trailing space. Notice that `plan-only` is listed first in the action options, which makes it the default selection. This is a safety measure: if you click "Run workflow" without changing the action dropdown, you get a plan preview rather than accidentally destroying production.
+
+**`environment: ${{ inputs.environment }}`** -- The job targets whichever environment you select from the dropdown. This is the same `environment` mechanism from the deploy workflow, and it carries the same implications. If your `prod` environment has required reviewers configured in GitHub's environment protection rules, even the power switch requires approval before it touches prod. You cannot accidentally destroy production -- the reviewer gate applies to every workflow that references the environment, not just the deploy workflow.
+
+**Conditional steps** -- Each `if: inputs.action == '...'` guard ensures only the matching step runs. The four actions map to different Terragrunt commands:
+
+- **`full-on`** runs `terragrunt stack run apply --feature deploy=true`, which applies the entire stack including the GPU instance. The `--feature deploy=true` flag maps to the same `feature "deploy"` block in the ec2-gpu unit template that the deploy workflow uses. Everything comes up.
+- **`standby`** runs `terragrunt stack run apply --feature deploy=false`. This is the feature flag from Part 7's ec2-gpu unit -- when `deploy` is `false`, the ec2-gpu unit is excluded from the stack. The GPU instance is destroyed, but the VPC, security groups, ALB, DNS, and all other networking infrastructure stays in place. Restarting from standby only needs to create the EC2 instance and its associated resources, which takes about 5 minutes instead of the 10-15 minutes required to rebuild everything from scratch.
+- **`full-off`** runs `terragrunt stack run destroy`, which tears down every resource in the environment. Your ongoing cost drops to zero. The S3 model cache bucket may remain if it has objects in it (Terraform will not destroy a non-empty bucket by default), but the compute and networking costs disappear entirely.
+- **`plan-only`** runs `terragrunt stack run plan`, which shows what would happen without making any changes. Use this to verify the current state before taking action.
+
+**`$GITHUB_STEP_SUMMARY`** -- The Summary step writes a markdown block to the workflow run's summary page. After the workflow finishes, you see a clean summary at the top of the run page: the environment, the action, and a human-readable description of what happened. This saves you from scrolling through raw Terraform logs to answer "did it work?"
+
+**Scheduled power management** -- For teams that want automatic cost savings, you can add a cron-triggered variant of this workflow. The idea is straightforward: destroy the dev environment every evening and recreate it every morning.
+
+```yaml
+# Example: scheduled power management
+on:
+  schedule:
+    - cron: '0 22 * * 1-5'  # Off at 10pm UTC weeknights
+    - cron: '0 13 * * 1-5'  # On at 1pm UTC (9am ET) weekdays
+```
+
+This is left as an exercise for the reader. Duplicate the power workflow, replace `workflow_dispatch` with a `schedule` trigger, and hardcode the inputs (environment and action) based on which cron expression fired. The savings are significant: running a GPU instance only during business hours cuts your compute cost by roughly 65%.
+
+### Pipeline Best Practices
+
+The four workflows -- PR validation, deploy, drift detection, and power switch -- form a complete GitOps pipeline. Here are practical recommendations for hardening it.
+
+**OIDC Over Static Keys** -- The OIDC authentication you configured in the Prerequisites section is not just convenient, it is a security boundary. OIDC credentials are scoped to a single workflow run and expire when the run finishes. There are no long-lived AWS access keys to rotate, no risk of a leaked key granting permanent access to your account. If you must store secrets (like the Infracost API key), use GitHub's encrypted secrets and reference them with `${{ secrets.SECRET_NAME }}` -- never hardcode credentials in workflow files or commit them to the repository.
+
+**Fork PR Security** -- GitHub requires maintainer approval before running workflows on pull requests from first-time contributors. Keep this default enabled (Settings > Actions > General > "Require approval for first-time contributors"). Fork PRs never get access to your repository secrets or OIDC credentials, even on public repositories. This means a malicious fork cannot modify a workflow file to exfiltrate your AWS credentials -- the workflow simply will not run until a maintainer approves it.
+
+**Branch Protection** -- Enable branch protection on `main`: require pull request reviews, require the `Validate` status check to pass, and prevent direct pushes (Settings > Branches > Add rule). This ensures every infrastructure change goes through the validation pipeline. No one can push a broken HCL format, a lint violation, or a security misconfiguration directly to `main`. The PR workflow catches it, the reviewer evaluates it, and only clean code gets merged.
+
+**CODEOWNERS** -- A `CODEOWNERS` file lets you require specific reviewers for sensitive paths. For example:
+
+```
+# .github/CODEOWNERS
+/live/prod/ @your-github-username
+```
+
+With this file in place and "Require review from Code Owners" enabled in branch protection, any PR that touches files under `live/prod/` requires explicit approval from the designated owner. Changes to dev can be reviewed by anyone on the team, but production changes need sign-off from the person responsible. This is especially valuable as your team grows.
+
+**Required Status Checks** -- Configure the `Validate` job as a required status check in your branch protection rules. This means a PR cannot be merged if formatting, linting, or security scanning fails. The `Plan` job should remain non-required -- plans can legitimately fail before dependencies exist. When you add a new unit whose VPC dependency has not been applied yet, the plan will fail, but that is expected. The plan comment helps reviewers understand the scope of the change; the validate check ensures code quality. Making the plan required would block legitimate PRs during early development.
