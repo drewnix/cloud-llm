@@ -1395,3 +1395,176 @@ Here is what you built and the Stacks concepts each piece demonstrated:
 | **`--filter`** | CLI flag -- target specific units without `cd`-ing into generated directories |
 
 The infrastructure itself -- a GPU instance running a quantized Qwen 2.5 Coder 32B behind an ALB with TLS, automated DNS, and model caching -- is production-grade. But the real takeaway is the Stacks pattern: modules define resources, units define wiring, stacks define environments. Write the unit once, compose it everywhere. When you internalize this three-layer architecture, you can apply it to any infrastructure project and never duplicate a wiring file again.
+
+---
+
+## Part 8: GitOps Pipeline
+
+### Why a Pipeline
+
+Up to this point, every `terragrunt stack run apply` has happened from your laptop. That works when you are the only person touching the infrastructure and you remember to run `plan` before `apply` and you never accidentally paste the wrong value into a terminal. In other words, it works until it does not. The moment a second engineer joins the project -- or you come back to it after three weeks and forget which environment you last applied -- manual deploys become a liability. There is no audit trail, no review of plan output before changes hit AWS, and no guarantee that two people are not applying conflicting changes at the same time.
+
+The deeper problem is visibility. When someone opens a pull request that changes a VPC CIDR or swaps the instance type from `g5.xlarge` to `g6.2xlarge`, the code reviewer sees the HCL diff but not what it will actually do. Will it recreate the instance? Will it tear down the NAT gateway and rebuild it? Without running `plan` against the real state, you are approving changes blind. A GitOps pipeline solves this by running `terragrunt stack run plan` automatically on every PR and posting the output as a comment. The reviewer sees exactly what will happen before clicking Merge.
+
+Then there is drift. Someone uses the AWS console to add an inbound rule to a security group. An auto-scaling event changes a tag. A provider upgrade shifts a default timeout. None of these show up in your HCL files, and without periodic detection you will not know until something breaks in production. A scheduled drift workflow runs `plan` on a cron, and if the plan is non-empty -- meaning real infrastructure has diverged from your code -- it opens an issue so you can decide whether to fix the code or re-apply.
+
+Part 8 covers the four GitHub Actions workflows that turn this repo into a proper GitOps pipeline: **PR validation** (lint, security scan, plan, cost estimate), **deploy** (auto-apply to dev on merge, gated apply to prod), **drift detection** (scheduled plan with issue creation), and a **power switch** (manual on/off for GPU instances to save costs). All four share a **composite action** for tool installation, and the validation layer uses four static analysis tools that run without AWS credentials.
+
+```
+.github/
+├── workflows/
+│   ├── pr.yml              # Validation + plan on pull requests
+│   ├── deploy.yml          # Apply on merge (dev auto, prod gated)
+│   ├── drift.yml           # Scheduled drift detection
+│   └── power.yml           # Manual infrastructure on/off switch
+└── actions/
+    └── terragrunt-setup/
+        └── action.yml      # Composite action: shared tool installation
+```
+
+### Prerequisites (CI/CD)
+
+Before the workflows can run, you need to wire up authentication, environments, and a couple of external services. This section covers the one-time setup.
+
+**OIDC Federation** -- The workflows need AWS credentials, but you should never store long-lived access keys as GitHub secrets. OIDC (OpenID Connect) federation lets GitHub Actions request short-lived credentials directly from AWS. Each workflow run gets a temporary token that expires in an hour, there are no secrets to rotate, and if someone forks your repo, their workflows cannot assume your role because the trust policy is scoped to your repository.
+
+Set it up in three steps:
+
+1. **Create the OIDC identity provider** in IAM. Go to IAM > Identity providers > Add provider. Select OpenID Connect, enter `token.actions.githubusercontent.com` as the provider URL, and `sts.amazonaws.com` as the audience.
+
+2. **Create an IAM role** with a trust policy that allows your repository to assume it:
+
+```json
+{
+  "Version": "2012-10-17",
+  "Statement": [{
+    "Effect": "Allow",
+    "Principal": {
+      "Federated": "arn:aws:iam::ACCOUNT_ID:oidc-provider/token.actions.githubusercontent.com"
+    },
+    "Action": "sts:AssumeRoleWithWebIdentity",
+    "Condition": {
+      "StringEquals": {
+        "token.actions.githubusercontent.com:aud": "sts.amazonaws.com"
+      },
+      "StringLike": {
+        "token.actions.githubusercontent.com:sub": "repo:OWNER/cloud-llm:*"
+      }
+    }
+  }]
+}
+```
+
+Replace `ACCOUNT_ID` with your 12-digit AWS account ID and `OWNER` with your GitHub username or organization. The `StringLike` condition with the wildcard means any branch, tag, or environment in that repository can assume the role. If you want to restrict it further -- for example, only allowing the `main` branch -- change the `sub` pattern to `repo:OWNER/cloud-llm:ref:refs/heads/main`.
+
+3. **Attach permissions** to the role. The role needs the same AWS permissions you used for manual deploys -- at minimum, the ability to manage VPCs, EC2, S3, IAM, ALBs, ACM, and CloudWatch. If you already have a policy from your manual setup, attach it to this role.
+
+**GitHub Environments** -- Go to your repository's Settings > Environments and create two environments:
+
+- **`dev`**: No protection rules. Add a variable `AWS_ROLE_ARN` set to the ARN of the IAM role you created above (e.g., `arn:aws:iam::123456789012:role/cloud-llm-ci`). Add a variable `GPU_ENABLED` set to `true`.
+- **`prod`**: Add a **required reviewer** -- this gates production deploys so that merging to `main` does not immediately apply to prod. Someone must approve the deployment in the GitHub UI. Add the same `AWS_ROLE_ARN` and `GPU_ENABLED` variables, pointing to the appropriate prod role if you use separate roles per environment.
+
+The deploy workflow references these environments by name. When a job specifies `environment: dev`, GitHub injects that environment's variables and enforces its protection rules. This is how the pipeline achieves "auto-deploy to dev, gated deploy to prod" without any conditional logic in the workflow itself.
+
+**Infracost** -- [Infracost](https://www.infracost.io/) estimates the cost impact of infrastructure changes and posts it as a PR comment. Sign up at infracost.io (the free tier covers open-source and small teams), generate an API key, and add it as a repository secret named `INFRACOST_API_KEY`. The PR workflow uses it to show a before/after cost breakdown so reviewers can see that changing an instance type from `g5.xlarge` to `g6.2xlarge` adds $X/month.
+
+**GitHub Labels** -- Create three labels in your repository: `drift`, `dev`, and `prod`. The drift detection workflow uses these to label auto-created issues so you can filter and triage them. Go to Issues > Labels > New label, or use the CLI:
+
+```bash
+gh label create drift --color "d73a4a" --description "Infrastructure drift detected"
+gh label create dev   --color "0e8a16" --description "Dev environment"
+gh label create prod  --color "fbca04" --description "Prod environment"
+```
+
+### The Composite Action
+
+Every workflow in the pipeline needs the same set of tools: Terraform, Terragrunt, tflint, and checkov. You could copy the installation steps into each workflow, but that defeats the DRY principle you have been applying throughout this project. Instead, you write a **composite action** -- a reusable set of steps that other workflows call like a function.
+
+```yaml
+# .github/actions/terragrunt-setup/action.yml
+
+name: 'Terragrunt Setup'
+description: 'Install Terraform, Terragrunt, tflint, and checkov for CI pipelines'
+
+inputs:
+  terraform-version:
+    description: 'Terraform version to install'
+    required: false
+    default: '1.12.1'
+  terragrunt-version:
+    description: 'Terragrunt version to install'
+    required: false
+    default: '0.80.6'
+  tflint-version:
+    description: 'tflint version to install'
+    required: false
+    default: '0.55.1'
+
+runs:
+  using: 'composite'
+  steps:
+    - name: Install Terraform
+      uses: hashicorp/setup-terraform@v3
+      with:
+        terraform_version: ${{ inputs.terraform-version }}
+        terraform_wrapper: false
+
+    - name: Install Terragrunt
+      uses: gruntwork-io/setup-terragrunt@v1
+      with:
+        terragrunt_version: ${{ inputs.terragrunt-version }}
+
+    - name: Install tflint
+      uses: terraform-linters/setup-tflint@v4
+      with:
+        tflint_version: "v${{ inputs.tflint-version }}"
+
+    - name: Install checkov
+      shell: bash
+      run: pip install checkov
+```
+
+Let's walk through the key decisions:
+
+**`using: 'composite'`** makes this a composite action -- a sequence of steps that gets inlined into the calling workflow's job. Unlike a Docker-based action, composite actions run directly on the runner, so they are fast and have access to the same filesystem. Every workflow calls it with `uses: ./.github/actions/terragrunt-setup`, and all four installation steps run as if they were written inline.
+
+**`terraform_wrapper: false`** is critical. The `hashicorp/setup-terraform` action installs a wrapper script by default that intercepts Terraform's stdout and stderr to expose them as step outputs. This sounds helpful, but it breaks Terragrunt. Terragrunt parses Terraform's output to extract plan summaries, dependency outputs, and error messages. The wrapper mangles that output, causing silent failures or garbled plan comments. Always disable it when using Terragrunt.
+
+**Version pinning via inputs** -- Each tool version has a default value but can be overridden by the calling workflow. This gives you reproducible builds (everyone runs the same versions) and easy upgrades (change the default in one file, all workflows pick it up). If you need to test a Terragrunt pre-release, you can pass `terragrunt-version: '0.81.0-rc1'` in a single workflow without affecting the others.
+
+**`pip install checkov`** -- Unlike the other tools, checkov does not have an official GitHub Actions setup action. It is a Python package, and `ubuntu-latest` runners come with Python and pip pre-installed, so a direct `pip install` is the simplest approach. If you want to pin the version for reproducibility, change it to `pip install checkov==3.2.x`.
+
+This is the same DRY pattern you applied in the infrastructure code: unit templates are written once and composed by every stack file; this composite action is written once and used by every workflow. Write the tooling once, reference it everywhere.
+
+### Validation & Linting
+
+Before a `plan` ever touches the cloud, four static analysis tools catch entire categories of errors locally. They run without AWS credentials -- no IAM role needed, no OIDC setup, no cost. This is why validation is a separate job in the PR workflow: it executes fast, in parallel with plan jobs, and fails the PR early if it finds problems.
+
+| Tool | What It Catches | Example |
+|---|---|---|
+| `terragrunt hclfmt` | Style inconsistencies in `.hcl` files | Misaligned `=` signs, wrong indentation |
+| `tflint` | Terraform-specific errors `validate` misses | Invalid instance type `g5.xbig`, deprecated syntax |
+| `checkov` | Security misconfigurations | S3 bucket without encryption, overly permissive security group |
+| `terragrunt validate-inputs` | Wiring bugs between stack/unit/module | Stack passes `vpc_cidr` but module expects `cidr_block` |
+
+**`terragrunt hclfmt --check`** is the HCL formatter, analogous to `gofmt` or `black`. It enforces consistent whitespace, alignment, and indentation across every `.hcl` file in the repo. The `--check` flag makes it exit non-zero if any file would change, which is what you want in CI -- the developer runs `terragrunt hclfmt` locally to fix issues, CI just verifies they did.
+
+**`tflint`** goes deeper than `terraform validate`. Where `validate` only checks syntax and internal consistency, tflint uses provider-specific rulesets to check whether the values you are passing actually make sense. If you set `instance_type = "g5.xbig"`, `terraform validate` says "looks fine, it's a string." tflint says "that instance type does not exist in AWS." It catches typos, deprecated resource attributes, and provider-specific anti-patterns that would otherwise surface only at `apply` time. It needs a configuration file to know which rulesets to load:
+
+```hcl
+# .tflint.hcl
+
+plugin "aws" {
+  enabled = true
+  version = "0.36.0"
+  source  = "github.com/terraform-linters/tflint-ruleset-aws"
+}
+```
+
+This enables the AWS ruleset, which knows about every EC2 instance type, every RDS engine version, and every S3 configuration option. When AWS releases new instance types or deprecates old ones, you update the ruleset version.
+
+**`checkov`** is a static security scanner. It evaluates your Terraform modules against hundreds of built-in policies: is the S3 bucket encrypted? Is the security group open to `0.0.0.0/0`? Is the IAM policy using `*` resources? It runs against the `.tf` files directly, no state required. In the PR workflow, checkov scans every module directory and reports findings as annotations on the PR. It is not a replacement for a thorough security review, but it catches the low-hanging fruit that is easy to miss in code review.
+
+**`terragrunt validate-inputs`** checks the wiring layer. Remember the three-layer architecture: stacks pass `values` to units, units map those values to module `inputs`. If the stack passes `vpc_cidr` but the module expects a variable named `cidr_block`, Terraform will not catch this until `plan` time -- and even then, the error message can be cryptic. `validate-inputs` compares what the unit is sending against what the module declares and flags mismatches immediately. This is especially valuable when you add a new variable to a module and forget to update one of the unit templates.
+
+All four tools run without AWS credentials -- they are pure static analysis. This is why validation is a separate job in the PR workflow: it runs fast, costs nothing, and catches entire categories of errors before a plan ever touches the cloud.
