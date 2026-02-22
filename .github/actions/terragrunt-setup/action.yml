@@ -1,0 +1,39 @@
+name: 'Terragrunt Setup'
+description: 'Install Terraform, Terragrunt, tflint, and checkov for CI pipelines'
+
+inputs:
+  terraform-version:
+    description: 'Terraform version to install'
+    required: false
+    default: '1.12.1'
+  terragrunt-version:
+    description: 'Terragrunt version to install'
+    required: false
+    default: '0.80.6'
+  tflint-version:
+    description: 'tflint version to install'
+    required: false
+    default: '0.55.1'
+
+runs:
+  using: 'composite'
+  steps:
+    - name: Install Terraform
+      uses: hashicorp/setup-terraform@v3
+      with:
+        terraform_version: ${{ inputs.terraform-version }}
+        terraform_wrapper: false
+
+    - name: Install Terragrunt
+      uses: gruntwork-io/setup-terragrunt@v1
+      with:
+        terragrunt_version: ${{ inputs.terragrunt-version }}
+
+    - name: Install tflint
+      uses: terraform-linters/setup-tflint@v4
+      with:
+        tflint_version: "v${{ inputs.tflint-version }}"
+
+    - name: Install checkov
+      shell: bash
+      run: pip install checkov
