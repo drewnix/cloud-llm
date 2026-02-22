@@ -51,6 +51,16 @@ This tutorial assumes you are comfortable writing Terraform modules but have not
   - [Provider Cache](#provider-cache)
   - [Filtering Units](#filtering-units)
   - [Extending the Stack](#extending-the-stack)
+- [Part 8: GitOps Pipeline](#part-8-gitops-pipeline)
+  - [Why a Pipeline](#why-a-pipeline)
+  - [Prerequisites (CI/CD)](#prerequisites-cicd)
+  - [The Composite Action](#the-composite-action)
+  - [Validation & Linting](#validation--linting)
+  - [The PR Workflow](#the-pr-workflow)
+  - [The Deploy Workflow](#the-deploy-workflow)
+  - [Drift Detection](#drift-detection)
+  - [Infrastructure Power Switch](#infrastructure-power-switch)
+  - [Pipeline Best Practices](#pipeline-best-practices)
 - [Recap](#recap)
 
 ---
@@ -1393,6 +1403,13 @@ Here is what you built and the Stacks concepts each piece demonstrated:
 | **`errors` block** | `root.hcl` -- automatic retry for transient AWS API errors during parallel deploys |
 | **`--provider-cache`** | CLI flag -- deduplicates provider downloads across all 8 units |
 | **`--filter`** | CLI flag -- target specific units without `cd`-ing into generated directories |
+| **Composite action** | `.github/actions/terragrunt-setup/` -- DRY tool installation across all workflows |
+| **PR validation** | `pr.yml` -- hclfmt, tflint, checkov, validate-inputs, plan, cost estimate |
+| **Environment gates** | `deploy.yml` -- auto-apply dev, reviewer approval for prod via GitHub Environments |
+| **Drift detection** | `drift.yml` -- scheduled plan with GitHub Issue reporting |
+| **Power switch** | `power.yml` -- full-on / standby / full-off via workflow dispatch |
+| **OIDC federation** | Short-lived AWS credentials from GitHub Actions, no stored keys |
+| **`--filter-affected` (CI)** | PR and deploy workflows plan/apply only units affected by the change |
 
 The infrastructure itself -- a GPU instance running a quantized Qwen 2.5 Coder 32B behind an ALB with TLS, automated DNS, and model caching -- is production-grade. But the real takeaway is the Stacks pattern: modules define resources, units define wiring, stacks define environments. Write the unit once, compose it everywhere. When you internalize this three-layer architecture, you can apply it to any infrastructure project and never duplicate a wiring file again.
 
