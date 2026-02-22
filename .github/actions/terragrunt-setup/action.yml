@@ -25,9 +25,9 @@ runs:
         terraform_wrapper: false
 
     - name: Install Terragrunt
-      uses: gruntwork-io/setup-terragrunt@v1
+      uses: autero1/action-terragrunt@v3
       with:
-        terragrunt_version: ${{ inputs.terragrunt-version }}
+        terragrunt-version: ${{ inputs.terragrunt-version }}
 
     - name: Install tflint
       uses: terraform-linters/setup-tflint@v4

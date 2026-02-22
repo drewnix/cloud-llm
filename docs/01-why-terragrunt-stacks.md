@@ -68,11 +68,11 @@ The components:
 
 - **VPC** with public and private subnets across two availability zones, internet gateway, and NAT gateway.
 - **Security groups** restricting the EC2 instance to only accept traffic from the ALB, not the public internet.
-- **ACM certificate** for TLS, validated via Cloudflare DNS.
+- **ACM certificate** for TLS, validated via Cloudflare DNS. (Note: Cloudflare DNS records used for ACM validation must be set to **DNS-only mode** -- grey cloud, not proxied -- and CNAME flattening must be disabled for the validation records.)
 - **Application Load Balancer** performing HTTPS termination and path-based routing: `/v1/*` goes to the vLLM OpenAI-compatible API, everything else goes to the Open WebUI chat interface.
-- **S3 bucket** caching downloaded model weights so the instance does not re-download 18+ GB from HuggingFace on every boot. A VPC gateway endpoint makes S3 access free and fast from within the VPC.
+- **S3 bucket** caching downloaded model weights so the instance does not re-download 18+ GB from HuggingFace on every boot. A VPC gateway endpoint eliminates data transfer costs and keeps S3 access fast within the VPC.
 - **IAM role** with least-privilege permissions: S3 model cache access, CloudWatch logs, and SSM Session Manager.
-- **EC2 GPU instance** (g5.xlarge with NVIDIA A10G, 24 GB VRAM) running vLLM and Open WebUI in Docker. Dev uses spot instances for ~70% cost savings.
+- **EC2 GPU instance** (g5.xlarge with NVIDIA A10G, 24 GB VRAM) running vLLM and Open WebUI in Docker. 24 GB is a tight fit for the quantized 32B model -- for production workloads with concurrent users, consider `gpu-memory-utilization=0.95` or `kv_cache_dtype="fp8"` for more KV cache headroom. Dev uses spot instances for ~60% cost savings.
 - **Cloudflare DNS** pointing `llm.example.com` at the ALB and creating ACM validation records.
 
 ### The Three-Layer Architecture
@@ -108,8 +108,8 @@ Data flows downward: the stack file passes values to units, and units pass input
 Before starting, make sure you have:
 
 - **AWS account** with permissions to create VPCs, EC2 instances, S3 buckets, IAM roles, ALBs, and ACM certificates
-- **Terraform >= 1.5** (`terraform version`)
-- **Terragrunt >= 0.80** (`terragrunt --version`) -- Stacks require Terragrunt 0.80+
+- **Terraform >= 1.10** (`terraform version`) -- 1.10+ required for native S3 state locking (`use_lockfile`); 1.11+ recommended for stable support
+- **Terragrunt >= 0.78** (`terragrunt --version`) -- Stacks require Terragrunt 0.78+
 - **AWS CLI configured** with credentials (`aws sts get-caller-identity` should succeed)
 - **Cloudflare account** with a domain managed by Cloudflare
 - **Cloudflare API token** with Zone:Read and DNS:Edit permissions, exported as `CLOUDFLARE_API_TOKEN`

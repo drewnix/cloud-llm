@@ -99,7 +99,7 @@ terragrunt output  # Show ALB outputs
 
 The GPU instance is the most expensive resource in the stack (~$1/hr on-demand). Sometimes you want to plan or operate the networking and supporting infrastructure without the GPU -- maybe you are iterating on ALB rules, or you just want to keep costs down between coding sessions.
 
-Terragrunt's `feature` block (available since v0.90) lets you define toggleable flags directly in a unit template. The ec2-gpu unit uses one:
+Terragrunt's `feature` block lets you define toggleable flags directly in a unit template. The ec2-gpu unit uses one:
 
 ```hcl
 # units/ec2-gpu/terragrunt.hcl

@@ -47,7 +47,7 @@ The project uses a **three-layer architecture**: Terraform modules define resour
 
 ## Prerequisites
 
-- **Terraform >= 1.5** and **Terragrunt >= 0.80** (Stacks require 0.80+)
+- **Terraform >= 1.10** (1.11+ recommended) and **Terragrunt >= 0.78** (Stacks require 0.78+)
 - **AWS account** with permissions for VPCs, EC2, S3, IAM, ALBs, ACM
 - **AWS CLI** configured with credentials
 - **Cloudflare account** with a managed domain and API token (`CLOUDFLARE_API_TOKEN`)

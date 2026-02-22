@@ -132,7 +132,7 @@ inputs = {
 
 Let's unpack the key concepts:
 
-**`remote_state`** replaces the `backend "s3"` block you would normally write in every module. Terragrunt generates a `backend.tf` file into each module directory before running `terraform init`. The `path_relative_to_include()` function returns the path from the root config to the child, so each component gets its own state file with a unique key. No key collisions, no manual tracking. The `use_lockfile = true` setting enables native S3 state locking, which is simpler than the older DynamoDB-based approach (no extra table to manage).
+**`remote_state`** replaces the `backend "s3"` block you would normally write in every module. Terragrunt generates a `backend.tf` file into each module directory before running `terraform init`. The `path_relative_to_include()` function returns the path from the root config to the child, so each component gets its own state file with a unique key. No key collisions, no manual tracking. The `use_lockfile = true` setting enables native S3 state locking (available since Terraform 1.10, stable in 1.11), which is simpler than the older DynamoDB-based approach (no extra table to manage). DynamoDB-based locking is now deprecated and will be removed in a future Terraform release.
 
 **`generate`** blocks write files into the module directory. The AWS provider block is generated once here and every component gets it. When you change the region or add a tag, you change one line and every component picks it up.
 
@@ -182,7 +182,7 @@ locals {
 locals {
   environment   = "dev"
   instance_type = "g5.xlarge"   # 1x A10G GPU, 24GB VRAM - ~$1.01/hr on-demand
-  use_spot      = true          # ~70% savings, acceptable for dev
+  use_spot      = true          # ~60% savings, acceptable for dev
   spot_max_price = "0.50"       # Cap spot price at $0.50/hr
 
   # EBS volume for model storage (models are ~18-20GB)

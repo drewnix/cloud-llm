@@ -114,9 +114,9 @@ runs:
         terraform_wrapper: false
 
     - name: Install Terragrunt
-      uses: gruntwork-io/setup-terragrunt@v1
+      uses: autero1/action-terragrunt@v3
       with:
-        terragrunt_version: ${{ inputs.terragrunt-version }}
+        terragrunt-version: ${{ inputs.terragrunt-version }}
 
     - name: Install tflint
       uses: terraform-linters/setup-tflint@v4
@@ -151,7 +151,7 @@ Before a `plan` ever touches the cloud, four static analysis tools catch entire 
 | `checkov` | Security misconfigurations | S3 bucket without encryption, overly permissive security group |
 | `terragrunt validate-inputs` | Wiring bugs between stack/unit/module | Stack passes `vpc_cidr` but module expects `cidr_block` |
 
-**`terragrunt hclfmt --check`** is the HCL formatter, analogous to `gofmt` or `black`. It enforces consistent whitespace, alignment, and indentation across every `.hcl` file in the repo. The `--check` flag makes it exit non-zero if any file would change, which is what you want in CI -- the developer runs `terragrunt hclfmt` locally to fix issues, CI just verifies they did.
+**`terragrunt hclfmt --check`** is the HCL formatter, analogous to `gofmt` or `black`. It enforces consistent whitespace, alignment, and indentation across every `.hcl` file in the repo. The `--check` flag makes it exit non-zero if any file would change, which is what you want in CI -- the developer runs `terragrunt hclfmt` locally to fix issues, CI just verifies they did. (Note: newer Terragrunt versions have reorganized this as `terragrunt hcl fmt --check`. The legacy `hclfmt` form still works but may emit deprecation warnings.)
 
 **`tflint`** goes deeper than `terraform validate`. Where `validate` only checks syntax and internal consistency, tflint uses provider-specific rulesets to check whether the values you are passing actually make sense. If you set `instance_type = "g5.xbig"`, `terraform validate` says "looks fine, it's a string." tflint says "that instance type does not exist in AWS." It catches typos, deprecated resource attributes, and provider-specific anti-patterns that would otherwise surface only at `apply` time. It needs a configuration file to know which rulesets to load:
 
@@ -169,7 +169,7 @@ This enables the AWS ruleset, which knows about every EC2 instance type, every R
 
 **`checkov`** is a static security scanner. It evaluates your Terraform modules against hundreds of built-in policies: is the S3 bucket encrypted? Is the security group open to `0.0.0.0/0`? Is the IAM policy using `*` resources? It runs against the `.tf` files directly, no state required. In the PR workflow, checkov scans every module directory and reports findings as annotations on the PR. It is not a replacement for a thorough security review, but it catches the low-hanging fruit that is easy to miss in code review.
 
-**`terragrunt validate-inputs`** checks the wiring layer. Remember the three-layer architecture: stacks pass `values` to units, units map those values to module `inputs`. If the stack passes `vpc_cidr` but the module expects a variable named `cidr_block`, Terraform will not catch this until `plan` time -- and even then, the error message can be cryptic. `validate-inputs` compares what the unit is sending against what the module declares and flags mismatches immediately. This is especially valuable when you add a new variable to a module and forget to update one of the unit templates.
+**`terragrunt validate-inputs`** checks the wiring layer. Remember the three-layer architecture: stacks pass `values` to units, units map those values to module `inputs`. If the stack passes `vpc_cidr` but the module expects a variable named `cidr_block`, Terraform will not catch this until `plan` time -- and even then, the error message can be cryptic. `validate-inputs` compares what the unit is sending against what the module declares and flags mismatches immediately. This is especially valuable when you add a new variable to a module and forget to update one of the unit templates. (Note: newer Terragrunt versions have reorganized this as `terragrunt hcl validate --inputs`. The legacy `validate-inputs` form still works but may emit deprecation warnings.)
 
 All four tools run without AWS credentials -- they are pure static analysis. This is why validation is a separate job in the PR workflow: it runs fast, costs nothing, and catches entire categories of errors before a plan ever touches the cloud.
 
@@ -371,7 +371,7 @@ Let's walk through the key pieces.
 
 **`continue-on-error: true` on the plan step** lets the workflow continue to the comment-posting steps even when the plan itself fails. This is a deliberate design choice. Without it, a plan failure would skip the PR comment steps, and the reviewer would have to dig through the raw workflow logs to understand what went wrong. With `continue-on-error`, the plan failure gets captured in `plan.txt`, packaged into a formatted PR comment, and posted for the reviewer to read directly on the PR. The explicit "Fail if plan errored" step at the end of the job checks `steps.plan.outputs.exitcode` and exits non-zero, so the job still reports failure in the GitHub status check. You get the best of both worlds: the reviewer sees the error inline, and the PR shows a red check.
 
-**The Infracost steps** generate a cost estimate alongside the plan. `infracost breakdown` reads the plan files from the `.terragrunt-stack` directory (where Terragrunt generates its working files) and produces a JSON cost estimate. `infracost output` converts that JSON into a GitHub-flavored markdown comment. The cost estimate appears in the PR comment alongside the plan, so reviewers see both what changes and what it costs. If you change an instance type from `g5.xlarge` to `g5.2xlarge`, the cost estimate shows the monthly delta. The `continue-on-error: true` on this step means a missing Infracost API key or a parsing error does not block the plan comment from posting -- cost is informational, not a gate.
+**The Infracost steps** generate a cost estimate alongside the plan. `infracost breakdown` reads the plan files from the `.terragrunt-stack` directory (where Terragrunt generates its working files) and produces a JSON cost estimate. (Note: Infracost's Terragrunt Stacks support may require pointing at individual `terragrunt.hcl` files within the generated directory if auto-detection does not pick them up. The `continue-on-error: true` on this step ensures cost estimation failures never block the plan.) `infracost output` converts that JSON into a GitHub-flavored markdown comment. The cost estimate appears in the PR comment alongside the plan, so reviewers see both what changes and what it costs. If you change an instance type from `g5.xlarge` to `g5.2xlarge`, the cost estimate shows the monthly delta. The `continue-on-error: true` on this step means a missing Infracost API key or a parsing error does not block the plan comment from posting -- cost is informational, not a gate.
 
 **`marocchino/sticky-pull-request-comment`** is the action that posts the PR comment. The `header` parameter (`plan-dev` or `plan-prod`) is the key: it tells the action to update the same comment on each push to the PR rather than creating a new one. Without this, every push would create a new comment, and a PR with 10 pushes would have 20 plan comments (one dev + one prod per push), burying the conversation in noise. The sticky behavior means there are always exactly two plan comments on the PR -- one for dev, one for prod -- and they always show the latest plan.
 
